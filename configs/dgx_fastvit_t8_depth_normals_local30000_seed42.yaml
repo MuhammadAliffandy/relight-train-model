@@ -17,6 +17,7 @@ experiment:
   amp: true
 
 data:
+  # Same Drive account visible at ~/xxdrive; rclone reads this remote directly for staging.
   rclone_source: xxdrive:AppleCapstoneRelighting/dataset/sources/SynthHuman
   # All paths below are relative to the cloned repository on the DGX.
   source_root: ./data/synthhuman_local30000/raw

@@ -71,7 +71,7 @@ For rclone mount, keep its VFS cache on `/raid` and set an explicit maximum size
 
 ## Option 2: copy 30,000 samples into the project
 
-If repeated reads through the rclone mount are too slow, stage a deterministic 30,000-sample subset into the cloned project. This copies the four original files per sample (RGB, alpha, depth EXR, normal EXR), about 120,000 files total. Data is stored under `data/synthhuman_local30000/`; its index/manifest and training outputs are also project-local and ignored by Git. The required disk space depends on source file sizes, so check free space before copying.
+The source dataset remains in the Drive mounted at `~/xxdrive`. If repeated reads through the mount are too slow, stage a deterministic 30,000-sample subset from the same Drive remote (`xxdrive:`) into the cloned project. This copies the four original files per sample (RGB, alpha, depth EXR, normal EXR), about 120,000 files total. Data is stored under `data/synthhuman_local30000/`; its index/manifest and training outputs are also project-local and ignored by Git. The required disk space depends on source file sizes, so check free space before copying.
 
 ```bash
 ./scripts/stage_dgx_subset.sh

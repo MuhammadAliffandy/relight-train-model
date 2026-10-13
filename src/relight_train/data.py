@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import subprocess
@@ -84,7 +85,7 @@ def build_raw_manifest(remote_path: str, source_root: Path, output_dir: Path, sa
                 relative, file_id = line.rstrip("\n").split("\t", 1)
                 add_path(relative, file_id)
     else:
-        command = ["rclone", "lsf", "--recursive", "--files-only", "--format", "pi", "--separator", "\t", remote_path]
+        command = [os.environ.get("RELIGHT_RCLONE_BIN", "rclone"), "lsf", "--recursive", "--files-only", "--format", "pi", "--separator", "\t", remote_path]
         print("Indexing filenames through rclone (metadata only; no image contents downloaded yet):", " ".join(command), flush=True)
         process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, bufsize=1)
         temporary_inventory = inventory_paths.with_suffix(".txt.tmp")

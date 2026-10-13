@@ -47,7 +47,7 @@ du -sh "$HOME/raid/Clara/relight_runtime/rclone_vfs"
 
 ## Local project copy (30k subset)
 
-To avoid repeatedly reading sample files over the mount, stage a deterministic 30,000-sample selection from the existing `xxdrive:` remote into the ignored project folder `data/synthhuman_local30000/raw/` (about 120,000 files: RGB, alpha, depth, normal). The exact selected manifest and file list are saved inside the project checkout. Check free disk space there before starting; raw source sizes vary.
+The source remains on the Drive mounted at `~/xxdrive`. To avoid repeatedly reading sample files over the mount, stage a deterministic 30,000-sample selection from the same `xxdrive:` remote into the ignored project folder `data/synthhuman_local30000/raw/` (about 120,000 files: RGB, alpha, depth, normal). The exact selected manifest and file list are saved inside the project checkout. Check free disk space there before starting; raw source sizes vary.
 
 ```bash
 ./scripts/stage_dgx_subset.sh

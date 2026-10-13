@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,6 +23,8 @@ def stage_local_subset(config_path: str | Path) -> None:
     source_root: Path = data["source_root"]
     run_dir: Path = output["run_dir"]
     source_root.mkdir(parents=True, exist_ok=True)
+    free_gib = shutil.disk_usage(source_root).free / 2**30
+    print(f"Free space on destination filesystem: {free_gib:.1f} GiB (raw subset size depends on source files)", flush=True)
 
     rows, partitions, report = build_raw_manifest(
         data["rclone_source"],
@@ -51,14 +54,12 @@ def stage_local_subset(config_path: str | Path) -> None:
         flush=True,
     )
     print(f"Destination inside project: {source_root}", flush=True)
-    free_gib = shutil.disk_usage(source_root).free / 2**30
-    print(f"Free space on destination filesystem: {free_gib:.1f} GiB (raw subset size depends on source files)", flush=True)
     print(f"Manifest and resumable file list: {run_dir}", flush=True)
     if report.get("complete_samples") is not None:
         print(f"Available complete source groups: {report['complete_samples']:,}", flush=True)
 
     command = [
-        "rclone", "copy", data["rclone_source"], str(source_root),
+        os.environ.get("RELIGHT_RCLONE_BIN", "rclone"), "copy", data["rclone_source"], str(source_root),
         "--files-from-raw", str(file_list),
         "--progress", "--stats", "10s", "--transfers", "8", "--checkers", "16",
         "--retries", "5", "--low-level-retries", "10",
