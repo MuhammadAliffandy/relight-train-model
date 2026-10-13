@@ -9,6 +9,8 @@ The active workflow separates Colab data inspection from DGX training:
 
 The current experiment predicts **metric depth and surface normals** from RGB with a FastViT-T8 encoder and compact FPN. Albedo is not trained. DGX indexes filenames through rclone, then reads RGB, alpha, depth EXR, and normal EXR directly from the mounted raw SynthHuman folder and preprocesses each sample in the data loader. No TAR shard preparation is required for the active DGX workflow.
 
+For a Colab comparison, `colab/notebooks/colab_synthhuman_6chunk_pilot.ipynb` stages six extracted Drive chunks (up to 30k samples) to `/content`, then runs raw-file preprocessing and a one-epoch depth+normal training pilot. It reports chunk-copy progress separately from per-batch training progress. The raw local copy is temporary; manifests and checkpoints are saved to Drive.
+
 ## DGX setup
 
 Requirements: Linux DGX with NVIDIA driver/CUDA support, Conda, rclone remote `xxdrive:`, and the existing SynthHuman source folder in Google Drive.
