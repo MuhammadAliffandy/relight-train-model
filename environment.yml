@@ -1,0 +1,14 @@
+name: relight-dgx
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - "torch>=2.4,<3"
+      - "torchvision>=0.19,<1"
+      - "timm>=1.0.12,<2"
+      - "numpy>=1.26,<3"
+      - "Pillow>=10,<13"
+      - "PyYAML>=6,<7"
+      - "tqdm>=4.66,<5"

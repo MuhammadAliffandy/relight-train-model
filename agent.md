@@ -3,7 +3,7 @@
 ## Goal and current status
 - Build an iOS tool for independent creators to relight a portrait/body crop with controllable key, fill, and rim lights.
 - The model predicts human-region geometry and reflectance; Swift/Vision handles person segmentation and compositing.
-- Current repository is a research prototype: `training_pipeline_relighting.ipynb` defines a supervised multi-task training/evaluation/export workflow. It has not yet been trained on real labels or validated on an iPhone.
+- Current repository is a research prototype: Colab notebooks are in `colab/notebooks/`; DGX training/evaluation code is in `src/relight_train/`. It has not yet been trained on the complete 50k prepared set on DGX or validated on an iPhone.
 
 ## Current model hypothesis
 - Model contract: one ImageNet-normalized RGB crop in; aligned depth, camera-frame surface normals, and diffuse albedo maps out.
@@ -13,15 +13,18 @@
 - Outputs: positive relative depth unless calibration metadata establishes metric scale; unit-length normals; albedo in [0, 1]. The notebook may use metric depth only when the dataset documents calibrated units; SynthHuman absolute depth is converted from cm to m. Do not call Sapiens monocular depth metric depth unless scale is independently calibrated.
 - Keep FastViT-T8 as the research baseline. Any alternative (including MobileNetV3) must earn a switch through matched quality, Core ML compatibility, and target-iPhone latency measurements; neither paper claims guarantee 60 FPS for our graph.
 
-## Notebook workflow
+## Colab and DGX workflow
 - Report dataset chunk totals and incomplete paired samples; report train/validation duration, epoch wall time, throughput, and ETA, and persist timing in the run history on Drive. Do not dump or visualize every sample by default.
-- Default the first training pilot to a deterministic 500-sample subset and 5 epochs, saved as a separate pilot manifest/run directory so checkpoints from earlier experiments cannot be mixed in. Require enough complete paired rows and keep the validation/test split non-empty.
+- Current Colab pilot: deterministic 50,000 SynthHuman samples, 5 epochs, depth + normals only, saved under a separate manifest/run directory. Keep the earlier 500-sample run settings distinct; do not reuse its checkpoints.
 - In Colab, mount Google Drive at the start of each fresh runtime and store dataset, manifest, caches, checkpoints, histories, metrics, and exported models under `MyDrive/AppleCapstoneRelighting`; reconnecting the runtime does not preserve local `/content` files.
-- Keep full-release SynthHuman acquisition in a separate optional notebook cell, disabled by default, isolated from the pilot pipeline. That cell processes official chunks sequentially into Drive and resumes using per-chunk completion markers. The release download is about 330 GB plus extracted/temp space; do not start it unless the user explicitly enables the cell in Colab after checking Drive capacity.
+- Keep Colab notebooks under `colab/notebooks/` and their helpers under `colab/scripts/`. Keep DGX Python modules in `src/relight_train/`, environment/config files at the repository root and `configs/`, and server commands in `scripts/`.
+- Keep acquisition notebooks separate from training. `colab/notebooks/download_synthhuman_full.ipynb` is the optional full-release downloader (~330 GB); `colab/notebooks/download_synthhuman_pilot_50k.ipynb` is optional. The active workflow reuses existing Drive source data and must not download the original release again.
+- The active Colab workflow packs the existing Drive dataset once via API in `colab/notebooks/prepare_synthhuman_shards.ipynb`, using 8 independent HTTP clients. The default preparation benchmark is 2 shards / 500 samples; setting `PREPARE_SHARD_LIMIT=None` completes 50,000 samples. Keep source files, completed shards, split metadata and preparation progress on Drive.
+- DGX training is Python/Conda based, never notebook based. Run `scripts/setup_dgx.sh`, verify data with `scripts/audit_dgx.sh`, start or resume with `scripts/train_dgx.sh`, and follow output with `scripts/tail_train.sh`. The training entry point requires a complete 50k prepared-shard manifest, reads TAR shards from the mounted rclone path, stages and checksum-validates them in local `/raid`, writes progress/checkpoints/history locally, and backs those artifacts up to the configured rclone remote. A mount or incomplete Drive manifest is not proof that all shard data is ready.
 - Colab Pro does not guarantee a specific GPU or uninterrupted runtime; checkpoints on Drive support recovery, but the actual runtime/session must be started and authorized by the user. Core ML prediction parity requires macOS even though conversion can run on Linux.
 - Training writes a mid-epoch resumable checkpoint to Drive every 10 minutes, with deterministic sample order, batch position, optimizer/scheduler/scaler and RNG state; a runtime interruption can lose at most the work since the last checkpoint.
 - Log CUDA availability/version, GPU name/count/capability and memory before training; show a per-batch live progress indicator and current losses during each epoch.
-- The Colab notebook has distinct cells for Drive setup, official SynthHuman subset download, automatic manifest generation, EXR decoding, sample audit, model, training, and evaluation. Use one chunk as the download ceiling for the initial pilot, but train first on a deterministic 500-sample subset for 5 epochs; expand only after validating labels and pilot behavior. SynthHuman has no albedo, so this trial supervises depth/normals only and cannot be exported as a trained three-output model.
+- Keep Drive authentication, selected-file API indexing, preprocessing/cache, sample audit, model, training and evaluation in distinct Colab cells. The active experiment selects 50,000 sample IDs with a fixed seed from the existing Drive folder and trains depth/normals for 5 epochs. The split is by sample IDs because real subject identities are unavailable.
 
 ## Data contract
 - Training uses a JSONL manifest with one record per sample: `image`, `depth`, `normal`, optional `albedo`, `mask`, and `subject_id` (paths may be absolute or relative to `DATA_ROOT`).
@@ -55,3 +58,10 @@
 ## Collaboration style
 - Speak professional, friendly Bahasa Indonesia; call the user Fandy when natural.
 - Separate evidence, project hypotheses, and measurements. Explain assumptions and give reproducible steps.
+
+- Drive API inventory v3 is used during preparation to find complete RGB/depth/normal/alpha groups across subfolders, reporting incomplete and ambiguous groups. Packing validates decoded tensors and stores depth/normals as float32, RGB as uint8, mask as uint8, without baked-in augmentation. Persist each completed archive and its SHA256; training verifies the checksum when staging it.
+- The shard training run is separate from the old direct-API run. Preparation uses a CPU runtime; switch to GPU after the full 50k set is ready. Report measured preparation time/size and training batch data wait; do not promise a speedup from simulated tests. Local cache and incomplete local shard work are temporary across runtime resets.
+
+- Shard preparation checks the EXR magic header and prefers OpenEXR >=3.3 with explicit depth/normal channel names (Z or R for depth; RGB or XYZ for normals). Keep channel order consistent across decoders. A metadata-complete group can still have corrupt file content; report decode failures without fabricating labels.
+
+- In an existing Colab runtime, EXR decoder activation must run after the original preprocessing definition. Preparation checks that the active read_array delegates to read_exr_array and stops before source reads if the old OpenCV-only function was restored.

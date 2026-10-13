@@ -1,0 +1,32 @@
+# Python and notebooks
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Local environments and secrets
+.env
+.venv/
+venv/
+conda-env/
+*.pem
+*token*.json
+credentials.json
+
+# Model weights, caches, and generated training artifacts
+*.pt
+*.pth
+*.safetensors
+*.mlpackage/
+*.mlmodel
+checkpoints/
+runs/
+relight_runtime/
+relight_logs/
+shard_cache/
+cache/
+outputs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
