@@ -1,4 +1,4 @@
-# Inventory cell for preparation/legacy direct-API notebooks; current training uses prepared shards.
+# Colab Drive API inventory helper. Active DGX training indexes the mounted raw folder through rclone.
 # Requires the runtime settings, Drive paths, and Drive API setup cells first.
 from tqdm.auto import tqdm
 import re

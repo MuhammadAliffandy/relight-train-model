@@ -1,0 +1,28 @@
+experiment:
+  name: fastvit_t8_fpn_depth_normals_local30000_seed42_v1
+  seed: 42
+  epochs: 5
+  batch_size: 8
+  workers: 8
+  input_size: [256, 256]
+  backbone: fastvit_t8.apple_in1k
+  pretrained: true
+  fpn_width: 48
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  depth_mode: metric
+  checkpoint_interval_minutes: 10
+  log_interval_steps: 25
+  progress_json_interval_steps: 25
+  amp: true
+
+data:
+  rclone_source: xxdrive:AppleCapstoneRelighting/dataset/sources/SynthHuman
+  # All paths below are relative to the cloned repository on the DGX.
+  source_root: ./data/synthhuman_local30000/raw
+  expected_samples: 30000
+  inventory_dir: ./data/synthhuman_local30000/index
+
+output:
+  run_dir: ./runs/fastvit_t8_fpn_depth_normals_local30000_seed42_v1
+  backup_remote: ""

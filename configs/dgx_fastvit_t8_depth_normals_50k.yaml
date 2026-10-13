@@ -1,9 +1,9 @@
 experiment:
-  name: fastvit_t8_fpn_depth_normals_shards50000_seed42_v1
+  name: fastvit_t8_fpn_depth_normals_raw50000_seed42_v1
   seed: 42
   epochs: 5
   batch_size: 8
-  workers: 0
+  workers: 8
   input_size: [256, 256]
   backbone: fastvit_t8.apple_in1k
   pretrained: true
@@ -17,15 +17,13 @@ experiment:
   amp: true
 
 data:
-  shard_dir: ~/xxdrive/AppleCapstoneRelighting/dataset/prepared_shards/synthhuman_50000_seed42_256x256_v1
+  rclone_source: xxdrive:AppleCapstoneRelighting/dataset/sources/SynthHuman
+  source_root: ~/xxdrive/AppleCapstoneRelighting/dataset/sources/SynthHuman
   expected_samples: 50000
-  expected_seed: 42
-  cache_dir: ~/raid/Clara/relight_runtime/shard_cache
-  cache_gib: 48
-  min_free_gib: 10
+  inventory_dir: ~/raid/Clara/relight_runtime/synthhuman_file_inventory_v1
 
 output:
-  run_dir: ~/raid/Clara/relight_runs/fastvit_t8_fpn_depth_normals_shards50000_seed42_v1
+  run_dir: ~/raid/Clara/relight_runs/fastvit_t8_fpn_depth_normals_raw50000_seed42_v1
   # Optional: rclone remote path for periodic checkpoint/history copies.
   # Keep blank to use the persistent DGX run directory only.
-  backup_remote: xxdrive:AppleCapstoneRelighting/runs/fastvit_t8_fpn_depth_normals_shards50000_seed42_v1
+  backup_remote: xxdrive:AppleCapstoneRelighting/runs/fastvit_t8_fpn_depth_normals_raw50000_seed42_v1

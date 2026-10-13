@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_DIR="${RELIGHT_LOG_DIR:-$HOME/raid/Clara/relight_logs}"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="${RELIGHT_LOG_DIR:-$PROJECT_ROOT/logs}"
 LOG_FILE="${1:-}"
 if [[ -z "$LOG_FILE" ]]; then
   LOG_FILE="$(find "$LOG_DIR" -maxdepth 1 -type f -name 'train_*.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"

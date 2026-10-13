@@ -26,6 +26,9 @@ relight_logs/
 shard_cache/
 cache/
 outputs/
+data/
+logs/
+.cache/
 
 # OS/editor noise
 .DS_Store

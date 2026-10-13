@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from relight_train.config import load_config
-from relight_train.data import PreparedShardDataset, load_packed_manifest, shard_sample_order
+from relight_train.data import RawSynthHumanDataset, build_raw_manifest
 from relight_train.model import PortraitGeometryModel
 from relight_train.objectives import GeometryObjective, evaluate
 
@@ -69,14 +70,16 @@ def main():
     else:
         raise RuntimeError("CUDA is unavailable. Activate the DGX Conda environment and check PyTorch CUDA support.")
 
-    manifest, records, partitions = load_packed_manifest(data_cfg["shard_dir"], int(data_cfg["expected_samples"]), int(data_cfg["expected_seed"]))
+    rows, partitions, inventory = build_raw_manifest(data_cfg["rclone_source"], data_cfg["source_root"], run_dir, int(data_cfg["expected_samples"]), seed, data_cfg["inventory_dir"])
+    selection_sha256 = hashlib.sha256("\n".join(sorted(row["subject_id"] for row in rows)).encode("utf-8")).hexdigest()
     part_sizes = {key: len(value) for key, value in partitions.items()}
-    print(f"Prepared dataset OK: {sum(part_sizes.values()):,} samples; split={part_sizes}; shards={len(records)}; selection={manifest['config']['selection_sha256'][:16]}", flush=True)
+    print(f"Raw dataset manifest ready: {sum(part_sizes.values()):,} samples; split={part_sizes}; inventory={inventory}", flush=True)
     datasets = {
-        key: PreparedShardDataset(value, records, data_cfg["shard_dir"], data_cfg["cache_dir"], data_cfg["cache_gib"], data_cfg["min_free_gib"], augment=(key == "train"))
+        key: RawSynthHumanDataset(value, exp["input_size"], augment=(key == "train"))
         for key, value in partitions.items()
     }
-    loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, num_workers=0, pin_memory=True, drop_last=False) for key, value in datasets.items()}
+    workers = int(exp["workers"])
+    loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, num_workers=workers, pin_memory=True, persistent_workers=(workers > 0), drop_last=False) for key, value in datasets.items()}
     sample = datasets["train"][0]
     image, depth, normal, mask = sample
     valid_depth = depth[0][mask[0] > 0]
@@ -109,8 +112,8 @@ def main():
     best_score = float("inf")
     if last_checkpoint.is_file():
         state = torch.load(last_checkpoint, map_location=device, weights_only=False)
-        if state.get("selection_sha256") != manifest["config"]["selection_sha256"]:
-            raise RuntimeError("Checkpoint belongs to a different prepared data selection; use a new run_dir or move old checkpoints.")
+        if state.get("selection_sha256") != selection_sha256:
+            raise RuntimeError("Checkpoint belongs to a different raw data selection; use a new run_dir or move old checkpoints.")
         model.load_state_dict(state["model"])
         objective.load_state_dict(state["objective"])
         optimizer.load_state_dict(state["optimizer"])
@@ -136,7 +139,7 @@ def main():
     print(f"Run plan: epochs={exp['epochs']} batch={exp['batch_size']} steps/epoch={train_steps:,} max_steps={total_steps:,} output={run_dir}", flush=True)
 
     def state_payload(epoch, batch, order, train_values, task_values, elapsed):
-        return {"epoch": epoch, "batch_in_epoch": batch, "epoch_order": order, "partial_train_totals": train_values, "partial_task_totals": task_values, "train_seconds_elapsed": elapsed, "model": model.state_dict(), "objective": objective.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(), "best_score": best_score, "history": history, "python_rng": random.getstate(), "numpy_rng": np.random.get_state(), "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all(), "selection_sha256": manifest["config"]["selection_sha256"], "experiment": exp}
+        return {"epoch": epoch, "batch_in_epoch": batch, "epoch_order": order, "partial_train_totals": train_values, "partial_task_totals": task_values, "train_seconds_elapsed": elapsed, "model": model.state_dict(), "objective": objective.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(), "best_score": best_score, "history": history, "python_rng": random.getstate(), "numpy_rng": np.random.get_state(), "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all(), "selection_sha256": selection_sha256, "experiment": exp}
 
     try:
         for epoch in range(start_epoch, int(exp["epochs"])):
@@ -152,9 +155,10 @@ def main():
             else:
                 train_totals = []
                 task_totals = {"depth_loss": [], "normal_loss": []}
-                epoch_order = shard_sample_order(datasets["train"], seed + epoch)
+                epoch_order = [(index, (seed + epoch * 1_000_003 + index) % (2**32)) for index in range(len(datasets["train"]))]
+                random.Random(seed + epoch).shuffle(epoch_order)
                 resume_batch = 0
-            loader = DataLoader(datasets["train"], batch_size=int(exp["batch_size"]), sampler=epoch_order[resume_batch * int(exp["batch_size"]):], num_workers=0, pin_memory=True, drop_last=False)
+            loader = DataLoader(datasets["train"], batch_size=int(exp["batch_size"]), sampler=epoch_order[resume_batch * int(exp["batch_size"]):], num_workers=workers, pin_memory=True, persistent_workers=(workers > 0), drop_last=False)
             prior_seconds = resume_train_seconds if epoch == start_epoch else 0.0
             last_checkpoint_time = time.monotonic()
             last_batch_end = time.perf_counter()
@@ -180,7 +184,7 @@ def main():
                     task_totals[key].append(float(value))
                 completed = batch_index + 1
                 memory = torch.cuda.memory_allocated(device) / 2**30
-                progress.set_postfix(iteration=f"{completed}/{train_steps}", loss=f"{float(loss.detach()):.4f}", depth=f"{float(parts['depth_loss']):.4f}", normal=f"{float(parts['normal_loss']):.4f}", gpu_mem=f"{memory:.1f}GiB", shards=datasets["train"].stats["copies"], data_s=f"{current_wait:.2f}", refresh=False)
+                progress.set_postfix(iteration=f"{completed}/{train_steps}", loss=f"{float(loss.detach()):.4f}", depth=f"{float(parts['depth_loss']):.4f}", normal=f"{float(parts['normal_loss']):.4f}", gpu_mem=f"{memory:.1f}GiB", data_s=f"{current_wait:.2f}", refresh=False)
                 if completed % int(exp["progress_json_interval_steps"]) == 0:
                     atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "batches_complete": completed, "batches_total": train_steps, "latest_train_loss": train_totals[-1], "last_update_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
                 if completed % int(exp["log_interval_steps"]) == 0:

@@ -1,197 +1,238 @@
 from __future__ import annotations
 
-import hashlib
-import io
 import json
 import random
-import shutil
-import tarfile
+import re
+import subprocess
 import time
-from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import Dataset
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
+FILE_PATTERN = re.compile(r"^(rgb|alpha|depth|normal)_(\d+)\.(png|exr)$")
+REQUIRED = {"rgb", "alpha", "depth", "normal"}
+
+
+def _atomic_json(path: Path, payload):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def build_raw_manifest(remote_path: str, source_root: Path, output_dir: Path, sample_count: int, seed: int, inventory_dir: Path, val_fraction=0.15, test_fraction=0.15):
+    """List modality filenames with rclone, then save a deterministic raw-file manifest."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "raw_dataset_manifest.jsonl"
+    report_path = output_dir / "raw_dataset_inventory.json"
+    metadata_path = output_dir / "raw_dataset_manifest.meta.json"
+    inventory_dir.mkdir(parents=True, exist_ok=True)
+    inventory_paths = inventory_dir / "relative_file_paths.txt"
+    inventory_meta_path = inventory_dir / "inventory.meta.json"
+    expected_inventory_meta = {"remote_path": remote_path, "source_root": str(source_root), "inventory_version": 1}
+    expected_meta = {"remote_path": remote_path, "source_root": str(source_root), "samples": sample_count, "seed": seed, "val_fraction": val_fraction, "test_fraction": test_fraction, "manifest_version": 1}
+    if manifest_path.is_file() and metadata_path.is_file():
+        saved_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if saved_meta == expected_meta:
+            rows = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if len(rows) == sample_count:
+                parts = {name: [row for row in rows if row["partition"] == name] for name in ("train", "val", "test")}
+                report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+                print(f"Reusing indexed raw manifest: {len(rows):,} samples ({manifest_path})", flush=True)
+                return rows, parts, report
+
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"rclone mount source folder is not accessible: {source_root}")
+    groups = {}
+    duplicate_ids = set()
+    scanned = 0
+    started = time.perf_counter()
+
+    def add_path(relative, file_id):
+        nonlocal scanned
+        relative = relative.strip().lstrip("/")
+        if not relative:
+            return
+        scanned += 1
+        filename = Path(relative).name
+        match = FILE_PATTERN.fullmatch(filename)
+        if not match:
+            return
+        kind, sample_id, extension = match.groups()
+        if extension != ("png" if kind in ("rgb", "alpha") else "exr"):
+            return
+        sample_id = int(sample_id)
+        group = groups.setdefault(sample_id, {})
+        object_ids = group.setdefault("_object_ids", {})
+        if kind in group and (group[kind] != relative or object_ids.get(kind) != file_id):
+            duplicate_ids.add(sample_id)
+        else:
+            group[kind] = relative
+            object_ids[kind] = file_id
+
+    cache_valid = False
+    if inventory_paths.is_file() and inventory_meta_path.is_file():
+        cache_valid = json.loads(inventory_meta_path.read_text(encoding="utf-8")) == expected_inventory_meta
+    if cache_valid:
+        print(f"Loading cached raw filename inventory: {inventory_paths}", flush=True)
+        with inventory_paths.open(encoding="utf-8") as handle:
+            for line in handle:
+                relative, file_id = line.rstrip("\n").split("\t", 1)
+                add_path(relative, file_id)
+    else:
+        command = ["rclone", "lsf", "--recursive", "--files-only", "--format", "pi", "--separator", "\t", remote_path]
+        print("Indexing filenames through rclone (metadata only; no image contents downloaded yet):", " ".join(command), flush=True)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, bufsize=1)
+        temporary_inventory = inventory_paths.with_suffix(".txt.tmp")
+        assert process.stdout is not None
+        with temporary_inventory.open("w", encoding="utf-8") as output:
+            for line in process.stdout:
+                relative, file_id = line.rstrip("\n").split("\t", 1)
+                relative = relative.strip().lstrip("/")
+                if not relative:
+                    continue
+                output.write(relative + "\t" + file_id + "\n")
+                add_path(relative, file_id)
+                if scanned % 100_000 == 0:
+                    elapsed_minutes = (time.perf_counter() - started) / 60
+                    print(f"Indexed {scanned:,} Drive entries; candidate samples={len(groups):,}; elapsed={elapsed_minutes:.1f} min", flush=True)
+        return_code = process.wait()
+        if return_code:
+            temporary_inventory.unlink(missing_ok=True)
+            raise RuntimeError(f"rclone filename inventory failed with exit code {return_code}")
+        temporary_inventory.replace(inventory_paths)
+        _atomic_json(inventory_meta_path, expected_inventory_meta)
+    complete_ids = sorted(sample_id for sample_id, group in groups.items() if REQUIRED <= group.keys() and sample_id not in duplicate_ids)
+    incomplete_count = sum(1 for group in groups.values() if not REQUIRED <= group.keys())
+    if len(complete_ids) < sample_count:
+        raise ValueError(f"Only {len(complete_ids):,} complete unambiguous RGB/alpha/depth/normal groups found; need {sample_count:,}. Check the rclone remote and source folder.")
+
+    selected_ids = sorted(random.Random(seed).sample(complete_ids, sample_count))
+    rows = []
+    for sample_id in selected_ids:
+        group = groups[sample_id]
+        rows.append({"image": str(source_root / group["rgb"]), "mask": str(source_root / group["alpha"]), "depth": str(source_root / group["depth"]), "normal": str(source_root / group["normal"]), "subject_id": f"sample_{sample_id:07d}", "label_source": "SynthHuman/DAViD renderer", "depth_units": "m", "depth_scale_to_m": 0.01, "normal_convention": "camera_xyz_signed"})
+    split_ids = sorted(row["subject_id"] for row in rows)
+    random.Random(seed).shuffle(split_ids)
+    n_test = max(1, round(len(split_ids) * test_fraction))
+    n_val = max(1, round(len(split_ids) * val_fraction))
+    test_ids = set(split_ids[:n_test])
+    val_ids = set(split_ids[n_test:n_test + n_val])
+    for row in rows:
+        row["partition"] = "test" if row["subject_id"] in test_ids else "val" if row["subject_id"] in val_ids else "train"
+    temporary = manifest_path.with_suffix(".jsonl.tmp")
+    temporary.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    temporary.replace(manifest_path)
+    metadata_path.write_text(json.dumps(expected_meta, indent=2), encoding="utf-8")
+    report = {"remote_path": remote_path, "source_root": str(source_root), "entries_scanned": scanned, "candidate_sample_ids": len(groups), "complete_samples": len(complete_ids), "incomplete_samples": incomplete_count, "ambiguous_sample_ids": len(duplicate_ids), "selected_samples": sample_count, "seed": seed, "inventory_minutes": (time.perf_counter() - started) / 60, "manifest": str(manifest_path), "cached_paths": str(inventory_paths)}
+    _atomic_json(report_path, report)
+    parts = {name: [row for row in rows if row["partition"] == name] for name in ("train", "val", "test")}
+    split_text = {name: len(partition) for name, partition in parts.items()}
+    print(f"Raw inventory complete: {len(complete_ids):,} complete IDs; {incomplete_count:,} incomplete; {len(duplicate_ids):,} ambiguous; selected={sample_count:,}; split={split_text}", flush=True)
+    print(f"Raw manifest saved: {manifest_path}; inventory time={(time.perf_counter()-started)/60:.1f} min", flush=True)
+    return rows, parts, report
+
+
+def _resize_array(array, size, is_mask=False):
+    array = np.asarray(array)
+    if array.ndim == 2:
+        array = array[..., None]
+    mode = Image.Resampling.NEAREST if is_mask or array.shape[-1] == 1 else Image.Resampling.BILINEAR
+    planes = [np.asarray(Image.fromarray(array[..., channel].astype(np.float32)).resize((size[1], size[0]), mode), dtype=np.float32) for channel in range(array.shape[-1])]
+    return np.stack(planes, axis=-1)
+
+
+def _read_exr(path: Path, kind: str):
     with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024**2), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def load_packed_manifest(shard_dir: Path, expected_samples: int, expected_seed: int):
-    manifest_path = shard_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Prepared shard manifest not found: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    config = manifest.get("config", {})
-    if not manifest.get("complete"):
-        ready = sum(len(record.get("rows", [])) for record in manifest.get("shards", []))
-        raise RuntimeError(f"Prepared dataset is incomplete ({ready:,}/{expected_samples:,} samples). Finish Colab shard preparation first.")
-    if config.get("samples") != expected_samples or config.get("seed") != expected_seed:
-        raise ValueError(f"Manifest sample count/seed mismatch: {config.get('samples')}/{config.get('seed')}")
-    if config.get("input_size") != [256, 256]:
-        raise ValueError(f"Unsupported prepared input size: {config.get('input_size')}")
-    if not config.get("selection_sha256"):
-        raise ValueError("Manifest has no selection_sha256")
-
-    records = {}
-    parts = {"train": [], "val": [], "test": []}
-    sample_ids = set()
-    for record in manifest.get("shards", []):
-        name = record.get("name", "")
-        if Path(name).name != name or not name.endswith(".tar"):
-            raise ValueError(f"Invalid shard filename: {name!r}")
-        if record.get("partition") not in parts:
-            raise ValueError(f"Invalid shard partition for {name}")
-        if not isinstance(record.get("bytes"), int) or record["bytes"] <= 0 or len(record.get("sha256", "")) != 64:
-            raise ValueError(f"Invalid size/checksum metadata for {name}")
-        path = shard_dir / name
-        if not path.is_file() or path.stat().st_size != record.get("bytes"):
-            raise OSError(f"Missing or incomplete shard: {path}")
-        records[name] = record
-        for row in record.get("rows", []):
-            sample_id = row.get("subject_id")
-            if not sample_id or sample_id in sample_ids:
-                raise ValueError(f"Missing or duplicate sample ID in shard manifest: {sample_id}")
-            if row.get("partition") != record["partition"] or row.get("shard") != name:
-                raise ValueError(f"Sample-to-shard assignment mismatch for {sample_id}")
-            if not row.get("member"):
-                raise ValueError(f"Missing archive member for sample {sample_id}")
-            sample_ids.add(sample_id)
-            parts[record["partition"]].append(row)
-    if len(sample_ids) != expected_samples:
-        raise ValueError(f"Expected {expected_samples:,} samples; manifest contains {len(sample_ids):,}")
-    if any(not parts[key] for key in parts):
-        raise ValueError(f"Empty data partition: { {key: len(value) for key, value in parts.items()} }")
-    return manifest, records, parts
-
-
-class PreparedShardDataset(Dataset):
-    def __init__(self, rows, records, shard_dir, cache_dir, cache_gib, min_free_gib, augment=False):
-        self.rows = rows
-        self.records = records
-        self.shard_dir = Path(shard_dir)
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_limit = int(cache_gib * 1024**3)
-        self.min_free = int(min_free_gib * 1024**3)
-        self.augment = augment
-        self.handles = OrderedDict()
-        self.cached = OrderedDict()
-        self.cached_bytes = 0
-        self.stats = {"copies": 0, "local_hits": 0, "copied_bytes": 0, "copy_seconds": 0.0}
-        for candidate in sorted(self.cache_dir.glob("*.tar"), key=lambda item: item.stat().st_mtime):
-            record = records.get(candidate.name)
-            if record and candidate.stat().st_size == record["bytes"]:
-                self.cached[candidate.name] = record["bytes"]
-                self.cached_bytes += record["bytes"]
+        prefix = handle.read(16)
+    if prefix[:4] != b"\x76\x2f\x31\x01":
+        raise ValueError(f"{path} has no valid EXR magic header (first16={prefix.hex()})")
+    try:
+        import OpenEXR
+    except ImportError as error:
+        raise RuntimeError('Install OpenEXR in the DGX environment: pip install "OpenEXR>=3.3,<4"') from error
+    if not hasattr(OpenEXR, "File"):
+        raise RuntimeError("OpenEXR >=3.3 is required for the named-channel decoder")
+    with OpenEXR.File(str(path), separate_channels=True) as exr:
+        if len(exr.parts) != 1:
+            raise ValueError(f"Multipart EXR is unsupported: {path}")
+        channels = exr.channels()
+        lookup = {name.upper(): name for name in channels}
+        if kind == "normal":
+            if {"R", "G", "B"} <= lookup.keys():
+                keys = ("R", "G", "B")
+            elif {"X", "Y", "Z"} <= lookup.keys():
+                keys = ("X", "Y", "Z")
             else:
-                candidate.unlink(missing_ok=True)
-        self._trim(0)
+                raise ValueError(f"Normal EXR needs RGB or XYZ channels, found {sorted(channels)}: {path}")
+        elif "Z" in lookup:
+            keys = ("Z",)
+        elif len(channels) == 1:
+            keys = (next(iter(channels)).upper(),)
+        elif "R" in lookup:
+            keys = ("R",)
+        else:
+            raise ValueError(f"Ambiguous depth EXR channels {sorted(channels)}: {path}")
+        planes = []
+        for key in keys:
+            pixels = channels[lookup[key]].pixels
+            if pixels.ndim != 2 or pixels.dtype.kind not in "fiu":
+                raise ValueError(f"Invalid EXR channel {key}: {path}")
+            planes.append(np.array(pixels, dtype=np.float32, copy=True))
+        return np.stack(planes, axis=-1)
+
+
+def _read_rgb(path: Path, size):
+    with Image.open(path) as image:
+        image = image.convert("RGB").resize((size[1], size[0]), Image.Resampling.BILINEAR)
+        return np.asarray(image, dtype=np.float32) / 255.0
+
+
+class RawSynthHumanDataset(Dataset):
+    def __init__(self, rows, input_size=(256, 256), augment=False):
+        self.rows = rows
+        self.input_size = tuple(input_size)
+        self.augment = augment
 
     def __len__(self):
         return len(self.rows)
 
     def close(self):
-        for handle in self.handles.values():
-            handle.close()
-        self.handles.clear()
-
-    def _trim(self, required):
-        while self.cached and self.cached_bytes + required > self.cache_limit:
-            name, size = self.cached.popitem(last=False)
-            handle = self.handles.pop(name, None)
-            if handle is not None:
-                handle.close()
-            (self.cache_dir / name).unlink(missing_ok=True)
-            self.cached_bytes -= size
-
-    def _open_shard(self, name):
-        if name in self.handles:
-            self.cached.move_to_end(name)
-            self.stats["local_hits"] += 1
-            return self.handles[name]
-        record = self.records[name]
-        size = record["bytes"]
-        if size > self.cache_limit:
-            raise OSError(f"Shard {name} ({size / 2**30:.2f} GiB) exceeds local cache limit")
-        target = self.cache_dir / name
-        start = time.perf_counter()
-        valid = target.is_file() and target.stat().st_size == size
-        if valid:
-            valid = sha256_file(target) == record["sha256"]
-        if not valid:
-            if name in self.cached:
-                self.cached_bytes -= self.cached.pop(name)
-            target.unlink(missing_ok=True)
-            self._trim(size)
-            if shutil.disk_usage(self.cache_dir).free < size + self.min_free:
-                raise OSError("Insufficient local disk for next shard; clear local cache or select a larger filesystem")
-            temporary = target.with_suffix(".tar.part")
-            try:
-                shutil.copyfile(self.shard_dir / name, temporary)
-                if temporary.stat().st_size != size or sha256_file(temporary) != record["sha256"]:
-                    raise IOError(f"Shard integrity check failed after staging: {name}")
-                temporary.replace(target)
-            except Exception:
-                temporary.unlink(missing_ok=True)
-                raise
-            elapsed = time.perf_counter() - start
-            self.stats["copies"] += 1
-            self.stats["copied_bytes"] += size
-            self.stats["copy_seconds"] += elapsed
-            print(f"Staged {name}: {size / 2**20:.1f} MiB in {elapsed:.1f}s", flush=True)
-        if name not in self.cached:
-            self.cached[name] = size
-            self.cached_bytes += size
-        self.cached.move_to_end(name)
-        handle = tarfile.open(target, "r:")
-        handle.getmembers()
-        self.handles[name] = handle
-        return handle
+        return None
 
     def __getitem__(self, index):
+        augmentation_seed = None
+        if isinstance(index, tuple):
+            index, augmentation_seed = index
         row = self.rows[index]
-        archive = self._open_shard(row["shard"])
-        member = archive.extractfile(row["member"])
-        if member is None:
-            raise OSError(f"Archive member missing: {row['member']} in {row['shard']}")
-        with member, np.load(io.BytesIO(member.read()), allow_pickle=False) as sample:
-            image = sample["rgb"].astype(np.float32) / 255.0
-            depth = sample["depth"].astype(np.float32)
-            normal = sample["normal"].astype(np.float32)
-            mask = sample["mask"].astype(np.float32)
-        size = (256, 256)
-        expected = {"image": (3, *size), "depth": (1, *size), "normal": (3, *size), "mask": (1, *size)}
-        for key, array in (("image", image), ("depth", depth), ("normal", normal), ("mask", mask)):
-            if array.shape != expected[key] or not np.isfinite(array).all():
-                raise ValueError(f"Invalid prepared {key} for {row['subject_id']}")
-        if mask.sum() <= 0:
-            raise ValueError(f"Empty valid mask for {row['subject_id']}")
-        if self.augment and random.random() < 0.5:
-            image, depth, normal, mask = [np.flip(array, axis=2).copy() for array in (image, depth, normal, mask)]
-            normal[0] *= -1
-        image = (image - np.array([0.485, 0.456, 0.406], np.float32)[:, None, None]) / np.array([0.229, 0.224, 0.225], np.float32)[:, None, None]
-        tensors = [torch.from_numpy(array.copy()).float() for array in (image, depth, normal, mask)]
+        image = _read_rgb(Path(row["image"]), self.input_size)
+        raw_depth = _read_exr(Path(row["depth"]), "depth")
+        normal = _read_exr(Path(row["normal"]), "normal")
+        with Image.open(row["mask"]) as alpha_image:
+            alpha = np.asarray(alpha_image.convert("L"))
+        mask = _resize_array((alpha > 0).astype(np.uint8) * 255, self.input_size, True)[..., 0] > 0
+        raw_depth = _resize_array(raw_depth.astype(np.float32), self.input_size)[..., 0]
+        normal = _resize_array(normal.astype(np.float32), self.input_size)
+        if normal.shape[-1] != 3:
+            raise ValueError(f"Expected 3-channel normals at {row['normal']}; found {normal.shape}")
+        valid_depth = np.isfinite(raw_depth) & (raw_depth > 0) & (raw_depth < 1000) & (~np.isclose(raw_depth, 65504.0, rtol=0.0, atol=1.0))
+        depth = raw_depth[..., None] * float(row.get("depth_scale_to_m", 0.01))
+        mask &= valid_depth & np.isfinite(normal).all(axis=-1)
+        depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+        normal = np.nan_to_num(normal, nan=0.0, posinf=0.0, neginf=0.0)
+        if mask.sum() == 0:
+            raise ValueError(f"No valid labeled pixels for {row['subject_id']}")
+        rng = random.Random(augmentation_seed) if augmentation_seed is not None else random
+        if self.augment and rng.random() < 0.5:
+            image, depth, normal, mask = [np.flip(array, axis=1).copy() for array in (image, depth, normal, mask)]
+            normal[..., 0] *= -1
+        image = (image - np.array([0.485, 0.456, 0.406], np.float32)) / np.array([0.229, 0.224, 0.225], np.float32)
+        tensors = [torch.from_numpy(array.copy()).permute(2, 0, 1).float() for array in (image, depth, normal)]
+        tensors.append(torch.from_numpy(mask[None].astype(np.float32)))
         tensors[2] = F.normalize(tensors[2], dim=0, eps=1e-6)
+        tensors[3] *= (torch.linalg.vector_norm(tensors[2], dim=0, keepdim=True) > 0).float()
         return tuple(tensors)
-
-
-def shard_sample_order(dataset: PreparedShardDataset, seed: int) -> list[int]:
-    grouped = {}
-    for index, row in enumerate(dataset.rows):
-        grouped.setdefault(row["shard"], []).append(index)
-    rng = random.Random(seed)
-    names = sorted(grouped)
-    rng.shuffle(names)
-    order = []
-    for name in names:
-        rng.shuffle(grouped[name])
-        order.extend(grouped[name])
-    return order

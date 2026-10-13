@@ -4,8 +4,8 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_NAME="${RELIGHT_CONDA_ENV:-relight-dgx}"
 CONFIG="${1:-$PROJECT_ROOT/configs/dgx_fastvit_t8_depth_normals_50k.yaml}"
-LOG_DIR="${RELIGHT_LOG_DIR:-$HOME/raid/Clara/relight_logs}"
-RUNTIME_DIR="${RELIGHT_RUNTIME_DIR:-$HOME/raid/Clara/relight_runtime}"
+LOG_DIR="${RELIGHT_LOG_DIR:-$PROJECT_ROOT/logs}"
+RUNTIME_DIR="${RELIGHT_RUNTIME_DIR:-$PROJECT_ROOT/.cache/relight_runtime}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="$LOG_DIR/train_$STAMP.log"
 

@@ -1,0 +1,27 @@
+experiment:
+  name: fastvit_t8_fpn_depth_normals_raw500_seed42_pilot
+  seed: 42
+  epochs: 1
+  batch_size: 8
+  workers: 8
+  input_size: [256, 256]
+  backbone: fastvit_t8.apple_in1k
+  pretrained: true
+  fpn_width: 48
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  depth_mode: metric
+  checkpoint_interval_minutes: 10
+  log_interval_steps: 1
+  progress_json_interval_steps: 10
+  amp: true
+
+data:
+  rclone_source: xxdrive:AppleCapstoneRelighting/dataset/sources/SynthHuman
+  source_root: ~/xxdrive/AppleCapstoneRelighting/dataset/sources/SynthHuman
+  expected_samples: 500
+  inventory_dir: ~/raid/Clara/relight_runtime/synthhuman_file_inventory_v1
+
+output:
+  run_dir: ~/raid/Clara/relight_runs/fastvit_t8_fpn_depth_normals_raw500_seed42_pilot
+  backup_remote: xxdrive:AppleCapstoneRelighting/runs/fastvit_t8_fpn_depth_normals_raw500_seed42_pilot

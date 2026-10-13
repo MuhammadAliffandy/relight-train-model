@@ -3,7 +3,7 @@
 ## Goal and current status
 - Build an iOS tool for independent creators to relight a portrait/body crop with controllable key, fill, and rim lights.
 - The model predicts human-region geometry and reflectance; Swift/Vision handles person segmentation and compositing.
-- Current repository is a research prototype: Colab notebooks are in `colab/notebooks/`; DGX training/evaluation code is in `src/relight_train/`. It has not yet been trained on the complete 50k prepared set on DGX or validated on an iPhone.
+- Current repository is a research prototype: active Colab notebooks are in `colab/notebooks/`; DGX training/evaluation code is in `src/relight_train/`. It has not yet been trained on the complete 50k raw sample selection on DGX or validated on an iPhone.
 
 ## Current model hypothesis
 - Model contract: one ImageNet-normalized RGB crop in; aligned depth, camera-frame surface normals, and diffuse albedo maps out.
@@ -15,15 +15,15 @@
 
 ## Colab and DGX workflow
 - Report dataset chunk totals and incomplete paired samples; report train/validation duration, epoch wall time, throughput, and ETA, and persist timing in the run history on Drive. Do not dump or visualize every sample by default.
-- Current Colab pilot: deterministic 50,000 SynthHuman samples, 5 epochs, depth + normals only, saved under a separate manifest/run directory. Keep the earlier 500-sample run settings distinct; do not reuse its checkpoints.
+- Current DGX experiment plan: deterministic 50,000 SynthHuman samples, 5 initial epochs, depth + normals only. Keep a 500-sample I/O throughput pilot in a separate run directory; do not reuse its checkpoints.
 - In Colab, mount Google Drive at the start of each fresh runtime and store dataset, manifest, caches, checkpoints, histories, metrics, and exported models under `MyDrive/AppleCapstoneRelighting`; reconnecting the runtime does not preserve local `/content` files.
-- Keep Colab notebooks under `colab/notebooks/` and their helpers under `colab/scripts/`. Keep DGX Python modules in `src/relight_train/`, environment/config files at the repository root and `configs/`, and server commands in `scripts/`.
+- Keep active Colab notebooks under `colab/notebooks/` and their helpers under `colab/scripts/`. Archive old shard experiments under `colab/archive/shards/`. Keep DGX Python modules in `src/relight_train/`, environment/config files at the repository root and `configs/`, and server commands in `scripts/`.
 - Keep acquisition notebooks separate from training. `colab/notebooks/download_synthhuman_full.ipynb` is the optional full-release downloader (~330 GB); `colab/notebooks/download_synthhuman_pilot_50k.ipynb` is optional. The active workflow reuses existing Drive source data and must not download the original release again.
-- The active Colab workflow packs the existing Drive dataset once via API in `colab/notebooks/prepare_synthhuman_shards.ipynb`, using 8 independent HTTP clients. The default preparation benchmark is 2 shards / 500 samples; setting `PREPARE_SHARD_LIMIT=None` completes 50,000 samples. Keep source files, completed shards, split metadata and preparation progress on Drive.
-- DGX training is Python/Conda based, never notebook based. Run `scripts/setup_dgx.sh`, verify data with `scripts/audit_dgx.sh`, start or resume with `scripts/train_dgx.sh`, and follow output with `scripts/tail_train.sh`. The training entry point requires a complete 50k prepared-shard manifest, reads TAR shards from the mounted rclone path, stages and checksum-validates them in local `/raid`, writes progress/checkpoints/history locally, and backs those artifacts up to the configured rclone remote. A mount or incomplete Drive manifest is not proof that all shard data is ready.
+- Previous Colab shard preparation/training is archived and is not part of the active DGX workflow.
+- DGX training is Python/Conda based, never notebook based. Run `scripts/setup_dgx.sh`, verify data with `scripts/audit_dgx.sh`, start or resume with `scripts/train_dgx.sh`, and follow output with `scripts/tail_train.sh`. The streaming entry point indexes existing raw files through rclone, selects 50k complete, unambiguous modality groups, and preprocesses images/EXRs on demand from the mount. A separate `scripts/stage_dgx_subset.sh` copies a deterministic 30k complete subset (RGB/alpha/depth/normal) into the ignored `data/synthhuman_local30000/` folder in the cloned project and can resume after interruption. Keep clone and staged subset in the project/work folder, not `/raid`; put only the bounded VFS cache on `/raid` for streaming.
 - Colab Pro does not guarantee a specific GPU or uninterrupted runtime; checkpoints on Drive support recovery, but the actual runtime/session must be started and authorized by the user. Core ML prediction parity requires macOS even though conversion can run on Linux.
-- Training writes a mid-epoch resumable checkpoint to Drive every 10 minutes, with deterministic sample order, batch position, optimizer/scheduler/scaler and RNG state; a runtime interruption can lose at most the work since the last checkpoint.
-- Log CUDA availability/version, GPU name/count/capability and memory before training; show a per-batch live progress indicator and current losses during each epoch.
+- Training writes a mid-epoch resumable checkpoint locally on DGX every 10 minutes, with deterministic sample order, batch position, optimizer/scheduler/scaler and RNG state; checkpoint/history copies go to the configured rclone remote.
+- Log CUDA availability/version, GPU name/count/capability and memory before training; show a per-batch live progress indicator, data-wait time and current losses during each epoch. DGX baseline initially uses one GPU until data throughput is measured.
 - Keep Drive authentication, selected-file API indexing, preprocessing/cache, sample audit, model, training and evaluation in distinct Colab cells. The active experiment selects 50,000 sample IDs with a fixed seed from the existing Drive folder and trains depth/normals for 5 epochs. The split is by sample IDs because real subject identities are unavailable.
 
 ## Data contract
@@ -60,7 +60,8 @@
 - Separate evidence, project hypotheses, and measurements. Explain assumptions and give reproducible steps.
 
 - Drive API inventory v3 is used during preparation to find complete RGB/depth/normal/alpha groups across subfolders, reporting incomplete and ambiguous groups. Packing validates decoded tensors and stores depth/normals as float32, RGB as uint8, mask as uint8, without baked-in augmentation. Persist each completed archive and its SHA256; training verifies the checksum when staging it.
-- The shard training run is separate from the old direct-API run. Preparation uses a CPU runtime; switch to GPU after the full 50k set is ready. Report measured preparation time/size and training batch data wait; do not promise a speedup from simulated tests. Local cache and incomplete local shard work are temporary across runtime resets.
+- The active DGX raw-source run is separate from archived shard-based Colab experiments. Log raw inventory duration, per-batch data wait, throughput and GPU utilization. Do not promise a speedup before a DGX pilot measurement.
+- The local-copy DGX option selects about 30,000 complete source samples, saves the exact manifest and rclone file list in the project, copies all four modalities with visible progress, verifies non-empty files, and decodes a copied sample. Use `configs/dgx_fastvit_t8_depth_normals_local30000_seed42.yaml` for local audit/training.
 
 - Shard preparation checks the EXR magic header and prefers OpenEXR >=3.3 with explicit depth/normal channel names (Z or R for depth; RGB or XYZ for normals). Keep channel order consistent across decoders. A metadata-complete group can still have corrupt file content; report decode failures without fabricating labels.
 
