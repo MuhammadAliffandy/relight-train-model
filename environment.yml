@@ -5,8 +5,11 @@ dependencies:
   - python=3.11
   - pip
   - pip:
-      - "torch>=2.4,<3"
-      - "torchvision>=0.19,<1"
+      # DGX driver 550.90 supports CUDA 12.4; pin this pair so setup cannot
+      # silently select a newer CUDA runtime than the installed host driver.
+      - "--extra-index-url=https://download.pytorch.org/whl/cu124"
+      - "torch==2.6.0+cu124"
+      - "torchvision==0.21.0+cu124"
       - "timm>=1.0.12,<2"
       - "numpy>=1.26,<3"
       - "Pillow>=10,<13"

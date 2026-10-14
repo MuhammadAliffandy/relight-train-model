@@ -97,7 +97,17 @@ def main():
     print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} targets=depth+normals", flush=True)
 
     optimizer = torch.optim.AdamW(list(model.parameters()) + list(objective.parameters()), lr=float(exp["learning_rate"]), weight_decay=float(exp["weight_decay"]))
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    scheduler_name = str(exp.get("scheduler", "plateau")).lower()
+    if scheduler_name == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(exp["epochs"]),
+            eta_min=float(exp.get("min_learning_rate", 1e-6)),
+        )
+    elif scheduler_name == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    else:
+        raise ValueError(f"Unsupported scheduler {scheduler_name!r}; expected 'cosine' or 'plateau'.")
     scaler = torch.amp.GradScaler("cuda", enabled=bool(exp["amp"]))
     checkpoint = run_dir / "best_checkpoint.pt"
     last_checkpoint = run_dir / "last_checkpoint.pt"
@@ -212,7 +222,10 @@ def main():
             sample_rate = part_sizes["train"] / max(train_seconds, 1e-6)
             eta = max(int(exp["epochs"]) - epoch - 1, 0) * epoch_seconds
             score = val_metrics["depth_rmse_m"] / 0.1 + val_metrics["normal_mean_deg"] / 30.0
-            scheduler.step(score)
+            if scheduler_name == "cosine":
+                scheduler.step()
+            else:
+                scheduler.step(score)
             improved = score < best_score
             if improved:
                 best_score = score

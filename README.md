@@ -88,4 +88,12 @@ After staging:
 ./scripts/train_dgx.sh configs/dgx_fastvit_t8_depth_normals_local30000_seed42.yaml
 ```
 
+For the 50k main run, use `configs/dgx_fastvit_t8_depth_normals_local50000_seed42.yaml`. It reuses the same local raw store and inventory as the 30k pilot, selects a deterministic 50k subset with seed 42 (including the pilot's 30k IDs), and copies only missing files. It uses a new run directory and one 100-epoch AdamW/cosine schedule; start once and select `best_checkpoint.pt` by validation score. The epoch count is evidence-informed by DAViD's 100-epoch training on SynthHuman, but the architecture and training setup differ, so treat validation as the stopping/model-selection signal. The training script supports both cosine and plateau schedulers.
+
+```bash
+./scripts/stage_dgx_subset.sh configs/dgx_fastvit_t8_depth_normals_local50000_seed42.yaml
+./scripts/audit_dgx.sh configs/dgx_fastvit_t8_depth_normals_local50000_seed42.yaml
+CUDA_VISIBLE_DEVICES=0 nohup ./scripts/train_dgx.sh configs/dgx_fastvit_t8_depth_normals_local50000_seed42.yaml > logs/train_local50000_cuda0.log 2>&1 < /dev/null &
+```
+
 This local-copy option uses rclone only for staging; training reads the copied files from the project disk. The separate 50k streaming path still uses the rclone mount and its bounded VFS cache on `/raid`.
