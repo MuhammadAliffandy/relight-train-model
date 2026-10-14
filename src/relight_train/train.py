@@ -89,6 +89,25 @@ def main():
 
     model = PortraitGeometryModel(exp["backbone"], bool(exp["pretrained"]), int(exp["fpn_width"])).to(device)
     objective = GeometryObjective(exp["depth_mode"]).to(device)
+    init_checkpoint = exp.get("init_checkpoint")
+    if init_checkpoint and not (run_dir / "last_checkpoint.pt").is_file():
+        init_checkpoint = Path(init_checkpoint)
+        if not init_checkpoint.is_file():
+            raise FileNotFoundError(f"Fine-tune initialization checkpoint not found: {init_checkpoint}")
+        initial_state = torch.load(init_checkpoint, map_location=device, weights_only=False)
+        source_experiment = initial_state.get("experiment", {})
+        compatibility = ("backbone", "fpn_width", "input_size", "depth_mode")
+        mismatches = {
+            key: (source_experiment.get(key), exp.get(key))
+            for key in compatibility
+            if source_experiment.get(key) != exp.get(key)
+        }
+        if mismatches:
+            raise RuntimeError(f"Initialization checkpoint architecture/config mismatch: {mismatches}")
+        model.load_state_dict(initial_state["model"])
+        if "objective" in initial_state:
+            objective.load_state_dict(initial_state["objective"])
+        print(f"Initialized fine-tuning from {init_checkpoint}; optimizer and scheduler start fresh.", flush=True)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     with torch.inference_mode():
         result = model(torch.zeros(2, 3, *exp["input_size"], device=device))

@@ -29,4 +29,6 @@ def load_config(path: str | Path) -> dict[str, Any]:
     data["source_root"] = _expand_path(data["source_root"])
     data["inventory_dir"] = _expand_path(data["inventory_dir"])
     output["run_dir"] = _expand_path(output["run_dir"])
+    if exp.get("init_checkpoint"):
+        exp["init_checkpoint"] = _expand_path(exp["init_checkpoint"])
     return config
