@@ -1,5 +1,5 @@
 experiment:
-  name: fastvit_t8_fpn_depth_normals_local50000_seed42_finetune_lr2e6_100ep_v1
+  name: fastvit_t8_fpn_depth_normals_local50000_seed42_finetune_lr2e6_384x512_100ep_v1
   seed: 42
   epochs: 100
   batch_size: 8
@@ -28,5 +28,5 @@ data:
   inventory_dir: ./data/synthhuman_local30000/index
 
 output:
-  run_dir: ./runs/fastvit_t8_fpn_depth_normals_local50000_seed42_finetune_lr2e6_100ep_v1
+  run_dir: ./runs/fastvit_t8_fpn_depth_normals_local50000_seed42_finetune_lr2e6_384x512_100ep_v1
   backup_remote: ""
