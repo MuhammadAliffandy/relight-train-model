@@ -96,7 +96,7 @@ def main():
             raise FileNotFoundError(f"Fine-tune initialization checkpoint not found: {init_checkpoint}")
         initial_state = torch.load(init_checkpoint, map_location=device, weights_only=False)
         source_experiment = initial_state.get("experiment", {})
-        compatibility = ("backbone", "fpn_width", "input_size", "depth_mode")
+        compatibility = ("backbone", "fpn_width", "depth_mode")
         mismatches = {
             key: (source_experiment.get(key), exp.get(key))
             for key in compatibility
@@ -107,11 +107,13 @@ def main():
         model.load_state_dict(initial_state["model"])
         if "objective" in initial_state:
             objective.load_state_dict(initial_state["objective"])
-        print(f"Initialized fine-tuning from {init_checkpoint}; optimizer and scheduler start fresh.", flush=True)
+        resolution_note = "same input resolution" if source_experiment.get("input_size") == exp["input_size"] else f"resolution {source_experiment.get('input_size')} -> {exp['input_size']}"
+        print(f"Initialized fine-tuning from {init_checkpoint}; {resolution_note}; optimizer and scheduler start fresh.", flush=True)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     with torch.inference_mode():
         result = model(torch.zeros(2, 3, *exp["input_size"], device=device))
-    if [tuple(item.shape) for item in result] != [(2, 1, 256, 256), (2, 3, 256, 256)]:
+    height, width = (int(size) for size in exp["input_size"])
+    if [tuple(item.shape) for item in result] != [(2, 1, height, width), (2, 3, height, width)]:
         raise RuntimeError("Model output shape audit failed")
     print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} targets=depth+normals", flush=True)
 

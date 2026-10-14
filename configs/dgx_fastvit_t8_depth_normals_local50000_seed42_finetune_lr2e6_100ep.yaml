@@ -4,7 +4,8 @@ experiment:
   epochs: 100
   batch_size: 8
   workers: 8
-  input_size: [256, 256]
+  # SynthHuman native resolution [height, width]; preserves the original aspect ratio.
+  input_size: [384, 512]
   backbone: fastvit_t8.apple_in1k
   pretrained: true
   fpn_width: 48

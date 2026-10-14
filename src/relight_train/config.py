@@ -20,8 +20,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
         if not isinstance(config.get(section), dict):
             raise ValueError(f"Missing config section: {section}")
     exp, data, output = config["experiment"], config["data"], config["output"]
-    if tuple(exp.get("input_size", ())) != (256, 256):
-        raise ValueError("Raw SynthHuman pipeline currently requires input_size [256, 256].")
+    input_size = tuple(int(size) for size in exp.get("input_size", ()))
+    if len(input_size) != 2 or any(size < 32 or size % 32 for size in input_size):
+        raise ValueError("input_size must be [height, width] with both dimensions positive multiples of 32.")
+    exp["input_size"] = list(input_size)
     if exp.get("depth_mode") not in ("metric", "relative"):
         raise ValueError("depth_mode must be metric or relative")
     if int(exp.get("batch_size", 0)) < 1 or int(exp.get("epochs", 0)) < 1:
