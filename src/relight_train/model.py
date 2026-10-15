@@ -50,16 +50,35 @@ class DepthwiseSeparableBlock(nn.Module):
 
 
 class CompactFPN(nn.Module):
-    def __init__(self, channels, width=48):
+    def __init__(self, channels, width=48, fusion="add"):
         super().__init__()
+        if fusion not in ("add", "concat"):
+            raise ValueError(f"Unsupported FPN fusion {fusion!r}; expected 'add' or 'concat'.")
+        self.fusion = fusion
         self.lateral = nn.ModuleList([nn.Conv2d(channel, width, 1) for channel in channels])
+        self.fusions = nn.ModuleList()
+        if fusion == "concat":
+            self.fusions = nn.ModuleList([nn.Conv2d(width * 2, width, 1) for _ in channels[:-1]])
+            # Start from the exact behavior of element-wise addition, then learn the fusion.
+            for layer in self.fusions:
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+                with torch.no_grad():
+                    for channel in range(width):
+                        layer.weight[channel, channel, 0, 0] = 1.0
+                        layer.weight[channel, width + channel, 0, 0] = 1.0
         self.smooth = nn.ModuleList([DepthwiseSeparableBlock(width) for _ in channels])
 
     def forward(self, features):
         output = self.smooth[-1](self.lateral[-1](features[-1]))
         for index in range(len(features) - 2, -1, -1):
             output = F.interpolate(output, size=features[index].shape[-2:], mode="bilinear", align_corners=False)
-            output = self.smooth[index](output + self.lateral[index](features[index]))
+            lateral = self.lateral[index](features[index])
+            if self.fusion == "add":
+                merged = output + lateral
+            else:
+                merged = self.fusions[index](torch.cat((output, lateral), dim=1))
+            output = self.smooth[index](merged)
         return output
 
 
@@ -74,7 +93,7 @@ class MobileTaskHead(nn.Module):
 
 
 class PortraitGeometryModel(nn.Module):
-    def __init__(self, backbone="fastvit_t8.apple_in1k", pretrained=True, fpn_width=48):
+    def __init__(self, backbone="fastvit_t8.apple_in1k", pretrained=True, fpn_width=48, fpn_fusion="add"):
         super().__init__()
         if backbone == "fastvit_t8.apple_in1k":
             self.encoder = FastViTEncoder(pretrained)
@@ -83,7 +102,7 @@ class PortraitGeometryModel(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
         self.backbone_name = backbone
-        self.neck = CompactFPN(self.encoder.channels, width=fpn_width)
+        self.neck = CompactFPN(self.encoder.channels, width=fpn_width, fusion=fpn_fusion)
         self.depth_head = MobileTaskHead(fpn_width, 1)
         self.normal_head = MobileTaskHead(fpn_width, 3)
 

@@ -87,7 +87,10 @@ def main():
     if any(size == 0 for size in part_sizes.values()):
         raise RuntimeError(f"All train/val/test partitions must be non-empty: {part_sizes}")
 
-    model = PortraitGeometryModel(exp["backbone"], bool(exp["pretrained"]), int(exp["fpn_width"])).to(device)
+    fpn_fusion = str(exp.get("fpn_fusion", "add"))
+    model = PortraitGeometryModel(
+        exp["backbone"], bool(exp["pretrained"]), int(exp["fpn_width"]), fpn_fusion
+    ).to(device)
     objective = GeometryObjective(exp["depth_mode"]).to(device)
     init_checkpoint = exp.get("init_checkpoint")
     if init_checkpoint and not (run_dir / "last_checkpoint.pt").is_file():
@@ -102,9 +105,25 @@ def main():
             for key in compatibility
             if source_experiment.get(key) != exp.get(key)
         }
+        source_fusion = str(source_experiment.get("fpn_fusion", "add"))
+        if source_fusion != fpn_fusion and not (source_fusion == "add" and fpn_fusion == "concat"):
+            mismatches["fpn_fusion"] = (source_fusion, fpn_fusion)
         if mismatches:
             raise RuntimeError(f"Initialization checkpoint architecture/config mismatch: {mismatches}")
-        model.load_state_dict(initial_state["model"])
+        if source_fusion == fpn_fusion:
+            model.load_state_dict(initial_state["model"])
+        else:
+            loaded = model.load_state_dict(initial_state["model"], strict=False)
+            expected_missing = {key for key in model.state_dict() if key.startswith("neck.fusions.")}
+            if set(loaded.missing_keys) != expected_missing or loaded.unexpected_keys:
+                raise RuntimeError(
+                    "Unexpected checkpoint transfer when initializing concat FPN: "
+                    f"missing={loaded.missing_keys}, unexpected={loaded.unexpected_keys}"
+                )
+            print(
+                "Transferred all compatible weights from additive FPN; "
+                "new concat fusion layers start as exact addition.", flush=True
+            )
         if "objective" in initial_state:
             objective.load_state_dict(initial_state["objective"])
         resolution_note = "same input resolution" if source_experiment.get("input_size") == exp["input_size"] else f"resolution {source_experiment.get('input_size')} -> {exp['input_size']}"
@@ -115,7 +134,7 @@ def main():
     height, width = (int(size) for size in exp["input_size"])
     if [tuple(item.shape) for item in result] != [(2, 1, height, width), (2, 3, height, width)]:
         raise RuntimeError("Model output shape audit failed")
-    print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} targets=depth+normals", flush=True)
+    print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} fusion={fpn_fusion} targets=depth+normals", flush=True)
 
     optimizer = torch.optim.AdamW(list(model.parameters()) + list(objective.parameters()), lr=float(exp["learning_rate"]), weight_decay=float(exp["weight_decay"]))
     scheduler_name = str(exp.get("scheduler", "plateau")).lower()
