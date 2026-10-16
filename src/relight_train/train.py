@@ -383,7 +383,7 @@ def main():
                     save_checkpoint(last_checkpoint, state_payload(epoch, completed, epoch_order, train_totals, task_totals, prior_seconds + time.perf_counter() - epoch_start))
                     atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "batches_complete": completed, "batches_total": train_steps, "status": "stopped_after_signal", "signal": signal.Signals(stop_requested[0]).name})
                     print(f"Stopped after signal; resume checkpoint saved at {last_checkpoint}", flush=True)
-                    return
+                    raise SystemExit(128 + stop_requested[0])
                 if time.monotonic() - last_checkpoint_time >= int(exp["checkpoint_interval_minutes"]) * 60:
                     stage["name"] = f"epoch {epoch + 1} batch {completed} checkpoint"
                     torch.cuda.synchronize()
