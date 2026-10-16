@@ -1,0 +1,35 @@
+experiment:
+  name: fastvit_t8_fpn_depth_normals_local50000_seed42_concatfusion_stride2refine_lr1e6_384x512_100ep_v1
+  seed: 42
+  epochs: 100
+  batch_size: 8
+  workers: 8
+  input_size: [384, 512]
+  backbone: fastvit_t8.apple_in1k
+  pretrained: false
+  fpn_width: 48
+  fpn_fusion: concat
+  depth_mode: metric
+  decoder_refinement: stride2
+  refinement_width: 16
+  # Start from the completed V2 concat-FPN checkpoint. New stride-2 decoder
+  # layers are initialized with zero output corrections.
+  init_checkpoint: ./runs/fastvit_t8_fpn_depth_normals_local50000_seed42_concatfusion_lr2e6_384x512_100ep_v1/best_checkpoint.pt
+  learning_rate: 0.000001
+  min_learning_rate: 0.0000001
+  scheduler: cosine
+  weight_decay: 0.0001
+  checkpoint_interval_minutes: 10
+  log_interval_steps: 25
+  progress_json_interval_steps: 25
+  amp: true
+
+data:
+  rclone_source: xxdrive:AppleCapstoneRelighting/dataset/sources/SynthHuman
+  source_root: ./data/synthhuman_local30000/raw
+  expected_samples: 50000
+  inventory_dir: ./data/synthhuman_local30000/index
+
+output:
+  run_dir: ./runs/fastvit_t8_fpn_depth_normals_local50000_seed42_concatfusion_stride2refine_lr1e6_384x512_100ep_v1
+  backup_remote: ""

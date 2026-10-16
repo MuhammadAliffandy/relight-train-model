@@ -26,6 +26,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
     exp["input_size"] = list(input_size)
     if exp.get("depth_mode") not in ("metric", "relative"):
         raise ValueError("depth_mode must be metric or relative")
+    if exp.get("decoder_refinement", "none") not in ("none", "stride2"):
+        raise ValueError("decoder_refinement must be none or stride2")
+    if int(exp.get("refinement_width", 16)) < 1:
+        raise ValueError("refinement_width must be positive")
     if int(exp.get("batch_size", 0)) < 1 or int(exp.get("epochs", 0)) < 1:
         raise ValueError("batch_size and epochs must be positive")
     data["source_root"] = _expand_path(data["source_root"])

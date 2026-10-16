@@ -92,8 +92,60 @@ class MobileTaskHead(nn.Module):
         return F.interpolate(self.predict(self.refine(x)), size=output_size, mode="bilinear", align_corners=False)
 
 
+class Stride2GeometryRefinement(nn.Module):
+    """Refine stride-4 geometry with stride-2 image and FPN cues."""
+    def __init__(self, fpn_width, width=16):
+        super().__init__()
+        self.rgb_stem = nn.Sequential(
+            nn.Conv2d(3, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
+        )
+        self.feature_projection = nn.Conv2d(fpn_width, width, 1)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(width * 2 + 4, width, 1, bias=False),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
+        )
+        self.refine = nn.Sequential(
+            DepthwiseSeparableBlock(width),
+            DepthwiseSeparableBlock(width),
+        )
+        self.depth_delta = nn.Conv2d(width, 1, 3, padding=1)
+        self.normal_delta = nn.Conv2d(width, 3, 3, padding=1)
+        nn.init.zeros_(self.depth_delta.weight)
+        nn.init.zeros_(self.depth_delta.bias)
+        nn.init.zeros_(self.normal_delta.weight)
+        nn.init.zeros_(self.normal_delta.bias)
+
+    def forward(self, image, fused, depth_coarse, normal_coarse, size):
+        image_detail = F.interpolate(image, size=size, mode="bilinear", align_corners=False)
+        rgb_features = self.rgb_stem(image_detail)
+
+        semantic = self.feature_projection(fused)
+        semantic = F.interpolate(semantic, size=size, mode="bilinear", align_corners=False)
+        coarse = F.interpolate(
+            torch.cat((depth_coarse, normal_coarse), dim=1),
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        features = self.fuse(torch.cat((rgb_features, semantic, coarse), dim=1))
+        features = self.refine(features)
+        return self.depth_delta(features), self.normal_delta(features)
+
+
 class PortraitGeometryModel(nn.Module):
-    def __init__(self, backbone="fastvit_t8.apple_in1k", pretrained=True, fpn_width=48, fpn_fusion="add"):
+    def __init__(
+        self,
+        backbone="fastvit_t8.apple_in1k",
+        pretrained=True,
+        fpn_width=48,
+        fpn_fusion="add",
+        decoder_refinement="none",
+        refinement_width=16,
+    ):
         super().__init__()
         if backbone == "fastvit_t8.apple_in1k":
             self.encoder = FastViTEncoder(pretrained)
@@ -105,10 +157,43 @@ class PortraitGeometryModel(nn.Module):
         self.neck = CompactFPN(self.encoder.channels, width=fpn_width, fusion=fpn_fusion)
         self.depth_head = MobileTaskHead(fpn_width, 1)
         self.normal_head = MobileTaskHead(fpn_width, 3)
+        if decoder_refinement not in ("none", "stride2"):
+            raise ValueError("decoder_refinement must be 'none' or 'stride2'.")
+        self.decoder_refinement = decoder_refinement
+        if decoder_refinement == "stride2":
+            self.refinement = Stride2GeometryRefinement(fpn_width, width=refinement_width)
 
     def forward(self, x):
         output_size = x.shape[-2:]
         fused = self.neck(self.encoder(x))
-        depth = F.softplus(self.depth_head(fused, output_size))
-        normals = F.normalize(self.normal_head(fused, output_size), p=2, dim=1, eps=1e-6)
+        depth_raw = self.depth_head.predict(self.depth_head.refine(fused))
+        normal_raw = self.normal_head.predict(self.normal_head.refine(fused))
+
+        depth_logits_full = F.interpolate(
+            depth_raw, size=output_size, mode="bilinear", align_corners=False
+        )
+        normal_raw_full = F.interpolate(
+            normal_raw, size=output_size, mode="bilinear", align_corners=False
+        )
+
+        if self.decoder_refinement == "stride2":
+            refinement_size = (output_size[0] // 2, output_size[1] // 2)
+            depth_coarse = F.interpolate(
+                depth_raw, size=refinement_size, mode="bilinear", align_corners=False
+            )
+            normal_coarse = F.interpolate(
+                normal_raw, size=refinement_size, mode="bilinear", align_corners=False
+            )
+            depth_delta, normal_delta = self.refinement(
+                x, fused, depth_coarse, normal_coarse, refinement_size
+            )
+            depth_logits_full = depth_logits_full + F.interpolate(
+                depth_delta, size=output_size, mode="bilinear", align_corners=False
+            )
+            normal_raw_full = normal_raw_full + F.interpolate(
+                normal_delta, size=output_size, mode="bilinear", align_corners=False
+            )
+
+        depth = F.softplus(depth_logits_full)
+        normals = F.normalize(normal_raw_full, p=2, dim=1, eps=1e-6)
         return depth, normals

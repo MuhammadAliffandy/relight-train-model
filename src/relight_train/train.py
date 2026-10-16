@@ -88,8 +88,15 @@ def main():
         raise RuntimeError(f"All train/val/test partitions must be non-empty: {part_sizes}")
 
     fpn_fusion = str(exp.get("fpn_fusion", "add"))
+    decoder_refinement = str(exp.get("decoder_refinement", "none"))
+    refinement_width = int(exp.get("refinement_width", 16))
     model = PortraitGeometryModel(
-        exp["backbone"], bool(exp["pretrained"]), int(exp["fpn_width"]), fpn_fusion
+        exp["backbone"],
+        bool(exp["pretrained"]),
+        int(exp["fpn_width"]),
+        fpn_fusion,
+        decoder_refinement,
+        refinement_width,
     ).to(device)
     objective = GeometryObjective(exp["depth_mode"]).to(device)
     init_checkpoint = exp.get("init_checkpoint")
@@ -108,22 +115,35 @@ def main():
         source_fusion = str(source_experiment.get("fpn_fusion", "add"))
         if source_fusion != fpn_fusion and not (source_fusion == "add" and fpn_fusion == "concat"):
             mismatches["fpn_fusion"] = (source_fusion, fpn_fusion)
+        source_refinement = str(source_experiment.get("decoder_refinement", "none"))
+        if source_refinement != decoder_refinement and not (
+            source_refinement == "none" and decoder_refinement == "stride2"
+        ):
+            mismatches["decoder_refinement"] = (source_refinement, decoder_refinement)
         if mismatches:
             raise RuntimeError(f"Initialization checkpoint architecture/config mismatch: {mismatches}")
-        if source_fusion == fpn_fusion:
+        if source_fusion == fpn_fusion and source_refinement == decoder_refinement:
             model.load_state_dict(initial_state["model"])
         else:
             loaded = model.load_state_dict(initial_state["model"], strict=False)
-            expected_missing = {key for key in model.state_dict() if key.startswith("neck.fusions.")}
+            expected_missing = set()
+            if source_fusion != fpn_fusion:
+                expected_missing.update(
+                    key for key in model.state_dict() if key.startswith("neck.fusions.")
+                )
+            if source_refinement != decoder_refinement:
+                expected_missing.update(
+                    key for key in model.state_dict() if key.startswith("refinement.")
+                )
             if set(loaded.missing_keys) != expected_missing or loaded.unexpected_keys:
                 raise RuntimeError(
-                    "Unexpected checkpoint transfer when initializing concat FPN: "
+                    "Unexpected checkpoint transfer while initializing the new architecture: "
                     f"missing={loaded.missing_keys}, unexpected={loaded.unexpected_keys}"
                 )
-            print(
-                "Transferred all compatible weights from additive FPN; "
-                "new concat fusion layers start as exact addition.", flush=True
-            )
+            if source_fusion != fpn_fusion:
+                print("Transferred additive FPN weights; new concat layers start as exact addition.", flush=True)
+            if source_refinement != decoder_refinement:
+                print("Transferred V2 weights; stride-2 refinement starts with zero output corrections.", flush=True)
         if "objective" in initial_state:
             objective.load_state_dict(initial_state["objective"])
         resolution_note = "same input resolution" if source_experiment.get("input_size") == exp["input_size"] else f"resolution {source_experiment.get('input_size')} -> {exp['input_size']}"
@@ -134,7 +154,7 @@ def main():
     height, width = (int(size) for size in exp["input_size"])
     if [tuple(item.shape) for item in result] != [(2, 1, height, width), (2, 3, height, width)]:
         raise RuntimeError("Model output shape audit failed")
-    print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} fusion={fpn_fusion} targets=depth+normals", flush=True)
+    print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} fusion={fpn_fusion} refinement={decoder_refinement}:{refinement_width} targets=depth+normals", flush=True)
 
     optimizer = torch.optim.AdamW(list(model.parameters()) + list(objective.parameters()), lr=float(exp["learning_rate"]), weight_decay=float(exp["weight_decay"]))
     scheduler_name = str(exp.get("scheduler", "plateau")).lower()
