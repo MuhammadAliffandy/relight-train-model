@@ -90,6 +90,8 @@ def main():
     fpn_fusion = str(exp.get("fpn_fusion", "add"))
     decoder_refinement = str(exp.get("decoder_refinement", "none"))
     refinement_width = int(exp.get("refinement_width", 16))
+    fullres_width = int(exp.get("fullres_width", 24))
+    rgb_full_width = int(exp.get("rgb_full_width", 8))
     model = PortraitGeometryModel(
         exp["backbone"],
         bool(exp["pretrained"]),
@@ -97,6 +99,8 @@ def main():
         fpn_fusion,
         decoder_refinement,
         refinement_width,
+        fullres_width,
+        rgb_full_width,
     ).to(device)
     objective = GeometryObjective(exp["depth_mode"]).to(device)
     init_checkpoint = exp.get("init_checkpoint")
@@ -106,57 +110,114 @@ def main():
             raise FileNotFoundError(f"Fine-tune initialization checkpoint not found: {init_checkpoint}")
         initial_state = torch.load(init_checkpoint, map_location=device, weights_only=False)
         source_experiment = initial_state.get("experiment", {})
-        compatibility = ("backbone", "fpn_width", "depth_mode")
-        mismatches = {
-            key: (source_experiment.get(key), exp.get(key))
-            for key in compatibility
-            if source_experiment.get(key) != exp.get(key)
-        }
-        source_fusion = str(source_experiment.get("fpn_fusion", "add"))
-        if source_fusion != fpn_fusion and not (source_fusion == "add" and fpn_fusion == "concat"):
-            mismatches["fpn_fusion"] = (source_fusion, fpn_fusion)
-        source_refinement = str(source_experiment.get("decoder_refinement", "none"))
-        if source_refinement != decoder_refinement and not (
-            source_refinement == "none" and decoder_refinement == "stride2"
-        ):
-            mismatches["decoder_refinement"] = (source_refinement, decoder_refinement)
-        if mismatches:
-            raise RuntimeError(f"Initialization checkpoint architecture/config mismatch: {mismatches}")
-        if source_fusion == fpn_fusion and source_refinement == decoder_refinement:
-            model.load_state_dict(initial_state["model"])
-        else:
-            loaded = model.load_state_dict(initial_state["model"], strict=False)
-            expected_missing = set()
-            if source_fusion != fpn_fusion:
-                expected_missing.update(
-                    key for key in model.state_dict() if key.startswith("neck.fusions.")
-                )
-            if source_refinement != decoder_refinement:
-                expected_missing.update(
-                    key for key in model.state_dict() if key.startswith("refinement.")
-                )
-            if set(loaded.missing_keys) != expected_missing or loaded.unexpected_keys:
+        init_mode = str(exp.get("init_mode", "full"))
+        if init_mode == "encoder_only":
+            if source_experiment.get("backbone") != exp.get("backbone"):
                 raise RuntimeError(
-                    "Unexpected checkpoint transfer while initializing the new architecture: "
-                    f"missing={loaded.missing_keys}, unexpected={loaded.unexpected_keys}"
+                    "Encoder-only initialization requires the same backbone: "
+                    f"{source_experiment.get('backbone')} vs {exp.get('backbone')}"
                 )
-            if source_fusion != fpn_fusion:
-                print("Transferred additive FPN weights; new concat layers start as exact addition.", flush=True)
-            if source_refinement != decoder_refinement:
-                print("Transferred V2 weights; stride-2 refinement starts with zero output corrections.", flush=True)
-        if "objective" in initial_state:
-            objective.load_state_dict(initial_state["objective"])
+            if source_experiment.get("depth_mode") != exp.get("depth_mode"):
+                raise RuntimeError(
+                    "Encoder-only initialization requires the same depth_mode: "
+                    f"{source_experiment.get('depth_mode')} vs {exp.get('depth_mode')}"
+                )
+            current_state = model.state_dict()
+            source_model_state = initial_state["model"]
+            encoder_weights = {
+                key: value
+                for key, value in source_model_state.items()
+                if key.startswith("encoder.")
+                and key in current_state
+                and current_state[key].shape == value.shape
+            }
+            expected_encoder = {key for key in current_state if key.startswith("encoder.")}
+            if set(encoder_weights) != expected_encoder:
+                missing_encoder = sorted(expected_encoder - set(encoder_weights))
+                raise RuntimeError(
+                    "Could not transfer the complete encoder from initialization checkpoint; "
+                    f"missing keys: {missing_encoder[:8]}"
+                )
+            model.load_state_dict(encoder_weights, strict=False)
+            if "objective" in initial_state:
+                objective.load_state_dict(initial_state["objective"])
+            print(
+                "Transferred FastViT encoder and task objective only; "
+                "FPN, heads, and full-resolution decoder start fresh.",
+                flush=True,
+            )
+            source_fusion = str(source_experiment.get("fpn_fusion", "add"))
+            source_refinement = str(source_experiment.get("decoder_refinement", "none"))
+        else:
+            compatibility = ("backbone", "fpn_width", "depth_mode")
+            mismatches = {
+                key: (source_experiment.get(key), exp.get(key))
+                for key in compatibility
+                if source_experiment.get(key) != exp.get(key)
+            }
+            source_fusion = str(source_experiment.get("fpn_fusion", "add"))
+            if source_fusion != fpn_fusion and not (source_fusion == "add" and fpn_fusion == "concat"):
+                mismatches["fpn_fusion"] = (source_fusion, fpn_fusion)
+            source_refinement = str(source_experiment.get("decoder_refinement", "none"))
+            if source_refinement != decoder_refinement and not (
+                source_refinement == "none" and decoder_refinement == "stride2"
+            ):
+                mismatches["decoder_refinement"] = (source_refinement, decoder_refinement)
+            if mismatches:
+                raise RuntimeError(f"Initialization checkpoint architecture/config mismatch: {mismatches}")
+            if source_fusion == fpn_fusion and source_refinement == decoder_refinement:
+                model.load_state_dict(initial_state["model"])
+            else:
+                loaded = model.load_state_dict(initial_state["model"], strict=False)
+                expected_missing = set()
+                if source_fusion != fpn_fusion:
+                    expected_missing.update(
+                        key for key in model.state_dict() if key.startswith("neck.fusions.")
+                    )
+                if source_refinement != decoder_refinement:
+                    expected_missing.update(
+                        key for key in model.state_dict() if key.startswith("refinement.")
+                    )
+                if set(loaded.missing_keys) != expected_missing or loaded.unexpected_keys:
+                    raise RuntimeError(
+                        "Unexpected checkpoint transfer while initializing the new architecture: "
+                        f"missing={loaded.missing_keys}, unexpected={loaded.unexpected_keys}"
+                    )
+                if source_fusion != fpn_fusion:
+                    print("Transferred additive FPN weights; new concat layers start as exact addition.", flush=True)
+                if source_refinement != decoder_refinement:
+                    print("Transferred V2 weights; stride-2 refinement starts with zero output corrections.", flush=True)
+            if "objective" in initial_state:
+                objective.load_state_dict(initial_state["objective"])
         resolution_note = "same input resolution" if source_experiment.get("input_size") == exp["input_size"] else f"resolution {source_experiment.get('input_size')} -> {exp['input_size']}"
-        print(f"Initialized fine-tuning from {init_checkpoint}; {resolution_note}; optimizer and scheduler start fresh.", flush=True)
+        transfer_note = (
+            "encoder-only warm start; FPN and decoder initialize fresh"
+            if str(exp.get("init_mode", "full")) == "encoder_only"
+            else "full compatible-model warm start"
+        )
+        print(f"Initialized from {init_checkpoint}; {transfer_note}; {resolution_note}; optimizer and scheduler start fresh.", flush=True)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     with torch.inference_mode():
         result = model(torch.zeros(2, 3, *exp["input_size"], device=device))
     height, width = (int(size) for size in exp["input_size"])
     if [tuple(item.shape) for item in result] != [(2, 1, height, width), (2, 3, height, width)]:
         raise RuntimeError("Model output shape audit failed")
-    print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} fusion={fpn_fusion} refinement={decoder_refinement}:{refinement_width} targets=depth+normals", flush=True)
+    print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} fusion={fpn_fusion} refinement={decoder_refinement}:stride2={refinement_width}:fullres={fullres_width} targets=depth+normals", flush=True)
 
-    optimizer = torch.optim.AdamW(list(model.parameters()) + list(objective.parameters()), lr=float(exp["learning_rate"]), weight_decay=float(exp["weight_decay"]))
+    encoder_lr = exp.get("encoder_learning_rate")
+    if encoder_lr is None:
+        optimizer_parameters = list(model.parameters()) + list(objective.parameters())
+    else:
+        encoder_parameter_ids = {id(parameter) for parameter in model.encoder.parameters()}
+        decoder_parameters = [
+            parameter for parameter in model.parameters()
+            if id(parameter) not in encoder_parameter_ids
+        ]
+        optimizer_parameters = [
+            {"params": list(model.encoder.parameters()), "lr": float(encoder_lr)},
+            {"params": decoder_parameters + list(objective.parameters()), "lr": float(exp["learning_rate"])},
+        ]
+    optimizer = torch.optim.AdamW(optimizer_parameters, lr=float(exp["learning_rate"]), weight_decay=float(exp["weight_decay"]))
     scheduler_name = str(exp.get("scheduler", "plateau")).lower()
     if scheduler_name == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -290,7 +351,7 @@ def main():
             if improved:
                 best_score = score
             peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
-            record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "selection_score": score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
+            record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "selection_score": score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[-1]["lr"], "encoder_lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
             history.append(record)
             atomic_json(history_path, history)
             completed = state_payload(epoch + 1, 0, None, [], {}, 0.0)

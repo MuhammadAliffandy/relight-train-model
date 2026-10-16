@@ -1,0 +1,39 @@
+experiment:
+  name: fastvit_t8_fpn72_depth_normals_local50000_seed42_fullres_refine_384x512_100ep_v1
+  seed: 42
+  epochs: 100
+  batch_size: 8
+  workers: 8
+  input_size: [384, 512]
+  backbone: fastvit_t8.apple_in1k
+  pretrained: false
+  fpn_width: 72
+  fpn_fusion: concat
+  depth_mode: metric
+  decoder_refinement: fullres
+  # Stride-2 context width; full-resolution features are compressed to 24 channels.
+  refinement_width: 48
+  fullres_width: 24
+  rgb_full_width: 8
+  # Reuse V2's FastViT encoder only; the 72-channel FPN and new decoder are initialized fresh.
+  init_checkpoint: ./runs/fastvit_t8_fpn_depth_normals_local50000_seed42_concatfusion_lr2e6_384x512_100ep_v1/best_checkpoint.pt
+  init_mode: encoder_only
+  learning_rate: 0.00001
+  encoder_learning_rate: 0.000001
+  min_learning_rate: 0.0000001
+  scheduler: cosine
+  weight_decay: 0.0001
+  checkpoint_interval_minutes: 10
+  log_interval_steps: 25
+  progress_json_interval_steps: 25
+  amp: true
+
+data:
+  rclone_source: xxdrive:AppleCapstoneRelighting/dataset/sources/SynthHuman
+  source_root: ./data/synthhuman_local30000/raw
+  expected_samples: 50000
+  inventory_dir: ./data/synthhuman_local30000/index
+
+output:
+  run_dir: ./runs/fastvit_t8_fpn_depth_normals_local50000_seed42_fpn72_fullres_lr1e5_384x512_100ep_v1
+  backup_remote: ""

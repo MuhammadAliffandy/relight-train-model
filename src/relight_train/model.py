@@ -136,6 +136,83 @@ class Stride2GeometryRefinement(nn.Module):
         return self.depth_delta(features), self.normal_delta(features)
 
 
+class FullResolutionGeometryRefinement(nn.Module):
+    """Progressively refine fused FPN features at stride-2 and input resolution."""
+    def __init__(self, fpn_width, stride2_width=48, fullres_width=24, rgb_full_width=8):
+        super().__init__()
+        self.rgb_half_stem = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+        )
+        self.feature_projection = nn.Conv2d(fpn_width, 48, 1)
+        self.coarse_fusion = nn.Sequential(
+            nn.Conv2d(48 + 16 + 4, stride2_width, 1, bias=False),
+            nn.BatchNorm2d(stride2_width),
+            nn.ReLU(inplace=True),
+        )
+        self.stride2_context = nn.Sequential(
+            DepthwiseSeparableBlock(stride2_width),
+            DepthwiseSeparableBlock(stride2_width),
+        )
+
+        self.rgb_full_stem = nn.Sequential(
+            nn.Conv2d(3, rgb_full_width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(rgb_full_width),
+            nn.ReLU(inplace=True),
+        )
+        self.fullres_fusion = nn.Sequential(
+            nn.Conv2d(stride2_width + rgb_full_width + 4, fullres_width, 1, bias=False),
+            nn.BatchNorm2d(fullres_width),
+            nn.ReLU(inplace=True),
+        )
+        self.fullres_context = DepthwiseSeparableBlock(fullres_width)
+        self.depth_delta = nn.Conv2d(fullres_width, 1, 3, padding=1)
+        self.normal_delta = nn.Conv2d(fullres_width, 3, 3, padding=1)
+        nn.init.zeros_(self.depth_delta.weight)
+        nn.init.zeros_(self.depth_delta.bias)
+        nn.init.zeros_(self.normal_delta.weight)
+        nn.init.zeros_(self.normal_delta.bias)
+
+    def forward(self, image, fused, depth_coarse, normal_coarse, size):
+        stride2_size = (size[0] // 2, size[1] // 2)
+        coarse_stride2 = F.interpolate(
+            torch.cat((depth_coarse, normal_coarse), dim=1),
+            size=stride2_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        rgb_stride2 = F.interpolate(
+            image, size=stride2_size, mode="bilinear", align_corners=False
+        )
+        semantic = F.interpolate(
+            self.feature_projection(fused),
+            size=stride2_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        stride2 = self.coarse_fusion(
+            torch.cat((semantic, self.rgb_half_stem(rgb_stride2), coarse_stride2), dim=1)
+        )
+        stride2 = self.stride2_context(stride2)
+
+        fullres_features = F.interpolate(
+            stride2, size=size, mode="bilinear", align_corners=False
+        )
+        coarse_full = F.interpolate(
+            torch.cat((depth_coarse, normal_coarse), dim=1),
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        rgb_full = self.rgb_full_stem(image)
+        fullres = self.fullres_fusion(
+            torch.cat((fullres_features, rgb_full, coarse_full), dim=1)
+        )
+        fullres = self.fullres_context(fullres)
+        return self.depth_delta(fullres), self.normal_delta(fullres)
+
+
 class PortraitGeometryModel(nn.Module):
     def __init__(
         self,
@@ -145,6 +222,8 @@ class PortraitGeometryModel(nn.Module):
         fpn_fusion="add",
         decoder_refinement="none",
         refinement_width=16,
+        fullres_width=24,
+        rgb_full_width=8,
     ):
         super().__init__()
         if backbone == "fastvit_t8.apple_in1k":
@@ -157,15 +236,25 @@ class PortraitGeometryModel(nn.Module):
         self.neck = CompactFPN(self.encoder.channels, width=fpn_width, fusion=fpn_fusion)
         self.depth_head = MobileTaskHead(fpn_width, 1)
         self.normal_head = MobileTaskHead(fpn_width, 3)
-        if decoder_refinement not in ("none", "stride2"):
-            raise ValueError("decoder_refinement must be 'none' or 'stride2'.")
+        if decoder_refinement not in ("none", "stride2", "fullres"):
+            raise ValueError("decoder_refinement must be 'none', 'stride2', or 'fullres'.")
         self.decoder_refinement = decoder_refinement
         if decoder_refinement == "stride2":
             self.refinement = Stride2GeometryRefinement(fpn_width, width=refinement_width)
+        elif decoder_refinement == "fullres":
+            self.pre_head_context = DepthwiseSeparableBlock(fpn_width)
+            self.refinement = FullResolutionGeometryRefinement(
+                fpn_width,
+                stride2_width=refinement_width,
+                fullres_width=fullres_width,
+                rgb_full_width=rgb_full_width,
+            )
 
     def forward(self, x):
         output_size = x.shape[-2:]
         fused = self.neck(self.encoder(x))
+        if self.decoder_refinement == "fullres":
+            fused = self.pre_head_context(fused)
         depth_raw = self.depth_head.predict(self.depth_head.refine(fused))
         normal_raw = self.normal_head.predict(self.normal_head.refine(fused))
 
@@ -193,6 +282,12 @@ class PortraitGeometryModel(nn.Module):
             normal_raw_full = normal_raw_full + F.interpolate(
                 normal_delta, size=output_size, mode="bilinear", align_corners=False
             )
+        elif self.decoder_refinement == "fullres":
+            depth_delta, normal_delta = self.refinement(
+                x, fused, depth_raw, normal_raw, output_size
+            )
+            depth_logits_full = depth_logits_full + depth_delta
+            normal_raw_full = normal_raw_full + normal_delta
 
         depth = F.softplus(depth_logits_full)
         normals = F.normalize(normal_raw_full, p=2, dim=1, eps=1e-6)
