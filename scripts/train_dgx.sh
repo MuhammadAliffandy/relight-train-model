@@ -15,6 +15,10 @@ export HF_HOME="$RUNTIME_DIR/huggingface"
 
 echo "Training log: $LOG_FILE"
 echo "To follow from another SSH session: tail -n 100 -f '$LOG_FILE'"
+if [[ -r /sys/fs/cgroup/memory.events ]]; then
+  echo "Cgroup memory events before training:"
+  cat /sys/fs/cgroup/memory.events
+fi
 cd "$PROJECT_ROOT"
 set +e
 conda run -n "$ENV_NAME" --no-capture-output python -u -m relight_train.train --config "$CONFIG" 2>&1 | tee -a "$LOG_FILE"
