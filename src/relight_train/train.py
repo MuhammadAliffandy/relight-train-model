@@ -315,9 +315,9 @@ def main():
         resume_train_seconds = state.get("train_seconds_elapsed", 0.0)
         random.setstate(state["python_rng"])
         np.random.set_state(state["numpy_rng"])
-        torch.set_rng_state(state["torch_rng"])
+        torch.set_rng_state(state["torch_rng"].cpu())
         if state.get("cuda_rng") is not None:
-            torch.cuda.set_rng_state_all(state["cuda_rng"])
+            torch.cuda.set_rng_state_all([rng.cpu() for rng in state["cuda_rng"]])
         print(f"Resuming at epoch {start_epoch + 1}, after {resume_batch} completed batches.", flush=True)
 
     train_steps = math.ceil(part_sizes["train"] / int(exp["batch_size"]))
