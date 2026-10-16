@@ -3,7 +3,8 @@ experiment:
   seed: 42
   epochs: 100
   batch_size: 8
-  workers: 8
+  workers: 2
+  prefetch_factor: 1
   input_size: [384, 512]
   backbone: fastvit_t8.apple_in1k
   pretrained: false
@@ -24,8 +25,8 @@ experiment:
   scheduler: cosine
   weight_decay: 0.0001
   checkpoint_interval_minutes: 10
-  log_interval_steps: 25
-  progress_json_interval_steps: 25
+  log_interval_steps: 10
+  progress_json_interval_steps: 10
   amp: true
 
 data:

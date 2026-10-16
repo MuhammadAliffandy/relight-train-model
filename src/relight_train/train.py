@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import hashlib
 import json
 import math
 import os
 import platform
 import random
+import signal
 import shutil
 import subprocess
 import time
@@ -45,6 +47,34 @@ def remote_backup(local_path: Path, remote_dir: str):
         print(f"WARNING: local file is safe, but rclone backup failed for {local_path.name}: {error}", flush=True)
 
 
+def process_memory_gib():
+    result = {}
+    status = Path("/proc/self/status")
+    try:
+        for line in status.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(":")
+            if key in ("VmRSS", "VmHWM"):
+                result[key.lower() + "_gib"] = round(int(value.strip().split()[0]) / 2**20, 3)
+    except OSError:
+        pass
+    for name in ("memory.current", "memory.peak", "memory.max"):
+        path = Path("/sys/fs/cgroup") / name
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+            if value.isdigit():
+                result["cgroup_" + name.split(".")[1] + "_gib"] = round(int(value) / 2**30, 3)
+        except OSError:
+            pass
+    try:
+        for line in Path("/sys/fs/cgroup/memory.events").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(" ")
+            if key in ("oom", "oom_kill"):
+                result["cgroup_" + key] = int(value)
+    except OSError:
+        pass
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train SynthHuman depth + surface-normal model")
     parser.add_argument("--config", required=True, help="YAML experiment configuration")
@@ -55,6 +85,18 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "epoch_outputs").mkdir(exist_ok=True)
     shutil.copy2(args.config, run_dir / "config.yaml")
+    faulthandler.enable()
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    stop_requested = []
+    stage = {"name": "startup"}
+
+    def request_stop(signum, _frame):
+        stop_requested.append(signum)
+        print(f"Received {signal.Signals(signum).name} during {stage['name']}; will checkpoint after the current batch. memory={process_memory_gib()}", flush=True)
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
 
     seed = int(exp["seed"])
     random.seed(seed)
@@ -79,7 +121,10 @@ def main():
         for key, value in partitions.items()
     }
     workers = int(exp["workers"])
-    loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, num_workers=workers, pin_memory=True, persistent_workers=(workers > 0), drop_last=False) for key, value in datasets.items()}
+    loader_options = {"num_workers": workers, "pin_memory": True, "drop_last": False}
+    if workers > 0:
+        loader_options["prefetch_factor"] = int(exp.get("prefetch_factor", 2))
+    loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, persistent_workers=False, **loader_options) for key, value in datasets.items()}
     sample = datasets["train"][0]
     image, depth, normal, mask = sample
     valid_depth = depth[0][mask[0] > 0]
@@ -298,13 +343,15 @@ def main():
                 epoch_order = [(index, (seed + epoch * 1_000_003 + index) % (2**32)) for index in range(len(datasets["train"]))]
                 random.Random(seed + epoch).shuffle(epoch_order)
                 resume_batch = 0
-            loader = DataLoader(datasets["train"], batch_size=int(exp["batch_size"]), sampler=epoch_order[resume_batch * int(exp["batch_size"]):], num_workers=workers, pin_memory=True, persistent_workers=(workers > 0), drop_last=False)
+            loader = DataLoader(datasets["train"], batch_size=int(exp["batch_size"]), sampler=epoch_order[resume_batch * int(exp["batch_size"]):], persistent_workers=False, **loader_options)
             prior_seconds = resume_train_seconds if epoch == start_epoch else 0.0
             last_checkpoint_time = time.monotonic()
             last_batch_end = time.perf_counter()
             data_wait = 0.0
             progress = tqdm(loader, total=train_steps, initial=resume_batch, desc=f"Epoch {epoch + 1}/{exp['epochs']}", unit="batch", dynamic_ncols=True)
+            stage["name"] = f"epoch {epoch + 1} waiting for batch {resume_batch + 1}"
             for batch_index, (x, d, n, m) in enumerate(progress, start=resume_batch):
+                stage["name"] = f"epoch {epoch + 1} batch {batch_index + 1} forward/backward"
                 current_wait = time.perf_counter() - last_batch_end
                 data_wait += current_wait
                 x, d, n, m = [item.to(device, non_blocking=True) for item in (x, d, n, m)]
@@ -324,17 +371,26 @@ def main():
                     task_totals[key].append(float(value))
                 completed = batch_index + 1
                 memory = torch.cuda.memory_allocated(device) / 2**30
+                peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
                 progress.set_postfix(iteration=f"{completed}/{train_steps}", loss=f"{float(loss.detach()):.4f}", depth=f"{float(parts['depth_loss']):.4f}", normal=f"{float(parts['normal_loss']):.4f}", gpu_mem=f"{memory:.1f}GiB", data_s=f"{current_wait:.2f}", refresh=False)
                 if completed % int(exp["progress_json_interval_steps"]) == 0:
                     atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "batches_complete": completed, "batches_total": train_steps, "latest_train_loss": train_totals[-1], "last_update_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
                 if completed % int(exp["log_interval_steps"]) == 0:
-                    print(f"epoch {epoch + 1:03d}/{exp['epochs']} batch {completed}/{train_steps} loss={train_totals[-1]:.4f} depth={float(parts['depth_loss']):.4f} normal={float(parts['normal_loss']):.4f} data_wait={current_wait:.2f}s gpu_mem={memory:.1f}GiB", flush=True)
+                    print(f"epoch {epoch + 1:03d}/{exp['epochs']} batch {completed}/{train_steps} loss={train_totals[-1]:.4f} depth={float(parts['depth_loss']):.4f} normal={float(parts['normal_loss']):.4f} data_wait={current_wait:.2f}s gpu_mem={memory:.2f}GiB gpu_peak={peak_memory:.2f}GiB memory={process_memory_gib()}", flush=True)
+                if stop_requested:
+                    stage["name"] = f"epoch {epoch + 1} batch {completed} checkpoint"
+                    save_checkpoint(last_checkpoint, state_payload(epoch, completed, epoch_order, train_totals, task_totals, prior_seconds + time.perf_counter() - epoch_start))
+                    atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "batches_complete": completed, "batches_total": train_steps, "status": "stopped_after_signal", "signal": signal.Signals(stop_requested[0]).name})
+                    print(f"Stopped after signal; resume checkpoint saved at {last_checkpoint}", flush=True)
+                    return
                 if time.monotonic() - last_checkpoint_time >= int(exp["checkpoint_interval_minutes"]) * 60:
+                    stage["name"] = f"epoch {epoch + 1} batch {completed} checkpoint"
                     torch.cuda.synchronize()
                     save_checkpoint(last_checkpoint, state_payload(epoch, completed, epoch_order, train_totals, task_totals, prior_seconds + time.perf_counter() - epoch_start))
                     remote_backup(last_checkpoint, output_cfg.get("backup_remote", ""))
                     last_checkpoint_time = time.monotonic()
                 last_batch_end = time.perf_counter()
+                stage["name"] = f"epoch {epoch + 1} waiting for batch {completed + 1}"
 
             torch.cuda.synchronize()
             train_seconds = prior_seconds + time.perf_counter() - epoch_start
