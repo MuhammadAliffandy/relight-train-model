@@ -317,7 +317,16 @@ def main():
         np.random.set_state(state["numpy_rng"])
         torch.set_rng_state(state["torch_rng"].cpu())
         if state.get("cuda_rng") is not None:
-            torch.cuda.set_rng_state_all([rng.cpu() for rng in state["cuda_rng"]])
+            saved_cuda_rng = state["cuda_rng"]
+            visible_gpus = torch.cuda.device_count()
+            torch.cuda.set_rng_state_all([rng.cpu() for rng in saved_cuda_rng[:visible_gpus]])
+            if len(saved_cuda_rng) != visible_gpus:
+                print(
+                    f"Checkpoint has RNG states for {len(saved_cuda_rng)} GPUs; "
+                    f"restored the first {min(len(saved_cuda_rng), visible_gpus)} "
+                    f"for {visible_gpus} visible GPUs.",
+                    flush=True,
+                )
         print(f"Resuming at epoch {start_epoch + 1}, after {resume_batch} completed batches.", flush=True)
 
     train_steps = math.ceil(part_sizes["train"] / int(exp["batch_size"]))
