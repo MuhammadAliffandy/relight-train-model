@@ -124,7 +124,8 @@ def main():
     loader_options = {"num_workers": workers, "pin_memory": True, "drop_last": False}
     if workers > 0:
         loader_options["prefetch_factor"] = int(exp.get("prefetch_factor", 2))
-    loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, persistent_workers=False, **loader_options) for key, value in datasets.items()}
+    persistent_workers = workers > 0 and str(exp.get("decoder_refinement", "none")) != "fullres"
+    loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, persistent_workers=persistent_workers, **loader_options) for key, value in datasets.items()}
     sample = datasets["train"][0]
     image, depth, normal, mask = sample
     valid_depth = depth[0][mask[0] > 0]
@@ -343,7 +344,7 @@ def main():
                 epoch_order = [(index, (seed + epoch * 1_000_003 + index) % (2**32)) for index in range(len(datasets["train"]))]
                 random.Random(seed + epoch).shuffle(epoch_order)
                 resume_batch = 0
-            loader = DataLoader(datasets["train"], batch_size=int(exp["batch_size"]), sampler=epoch_order[resume_batch * int(exp["batch_size"]):], persistent_workers=False, **loader_options)
+            loader = DataLoader(datasets["train"], batch_size=int(exp["batch_size"]), sampler=epoch_order[resume_batch * int(exp["batch_size"]):], persistent_workers=persistent_workers, **loader_options)
             prior_seconds = resume_train_seconds if epoch == start_epoch else 0.0
             last_checkpoint_time = time.monotonic()
             last_batch_end = time.perf_counter()
