@@ -62,7 +62,7 @@ def main():
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = str(exp.get("decoder_refinement", "none")) != "fullres"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(json.dumps({"python": platform.python_version(), "torch": torch.__version__, "device": str(device)}, indent=2), flush=True)
     if device.type == "cuda":
@@ -197,11 +197,20 @@ def main():
         )
         print(f"Initialized from {init_checkpoint}; {transfer_note}; {resolution_note}; optimizer and scheduler start fresh.", flush=True)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    audit_batch_size = 1 if decoder_refinement == "fullres" else 2
+    print(f"Running model output-shape audit (batch={audit_batch_size}, refinement={decoder_refinement})...", flush=True)
     with torch.inference_mode():
-        result = model(torch.zeros(2, 3, *exp["input_size"], device=device))
+        audit_input = torch.zeros(audit_batch_size, 3, *exp["input_size"], device=device)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(exp["amp"])):
+            result = model(audit_input)
+        torch.cuda.synchronize(device)
     height, width = (int(size) for size in exp["input_size"])
-    if [tuple(item.shape) for item in result] != [(2, 1, height, width), (2, 3, height, width)]:
+    if [tuple(item.shape) for item in result] != [
+        (audit_batch_size, 1, height, width),
+        (audit_batch_size, 3, height, width),
+    ]:
         raise RuntimeError("Model output shape audit failed")
+    print("Model output-shape audit passed.", flush=True)
     print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} fusion={fpn_fusion} refinement={decoder_refinement}:stride2={refinement_width}:fullres={fullres_width} targets=depth+normals", flush=True)
 
     encoder_lr = exp.get("encoder_learning_rate")
