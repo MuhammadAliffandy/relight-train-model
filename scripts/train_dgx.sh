@@ -21,8 +21,15 @@ if [[ -r /sys/fs/cgroup/memory.events ]]; then
 fi
 cd "$PROJECT_ROOT"
 set +e
-conda run -n "$ENV_NAME" --no-capture-output python -u -m relight_train.train --config "$CONFIG" 2>&1 | tee -a "$LOG_FILE"
-TRAIN_STATUS=${PIPESTATUS[0]}
+if [[ ${CONDA_DEFAULT_ENV:-} == "$ENV_NAME" ]]; then
+  echo "Using active Conda environment: $ENV_NAME" | tee -a "$LOG_FILE"
+  python -u -m relight_train.train --config "$CONFIG" 2>&1 | tee -a "$LOG_FILE"
+  TRAIN_STATUS=${PIPESTATUS[0]}
+else
+  echo "Launching through conda run: $ENV_NAME" | tee -a "$LOG_FILE"
+  conda run -n "$ENV_NAME" --no-capture-output python -u -m relight_train.train --config "$CONFIG" 2>&1 | tee -a "$LOG_FILE"
+  TRAIN_STATUS=${PIPESTATUS[0]}
+fi
 set -e
 echo "Training command exit status: $TRAIN_STATUS" | tee -a "$LOG_FILE"
 if [[ -r /sys/fs/cgroup/memory.events ]]; then
