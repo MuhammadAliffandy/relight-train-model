@@ -138,6 +138,7 @@ def main():
     refinement_width = int(exp.get("refinement_width", 16))
     fullres_width = int(exp.get("fullres_width", 24))
     rgb_full_width = int(exp.get("rgb_full_width", 8))
+    auxiliary_weight = float(exp.get("auxiliary_loss_weight", 0.0))
     model = PortraitGeometryModel(
         exp["backbone"],
         bool(exp["pretrained"]),
@@ -147,8 +148,12 @@ def main():
         refinement_width,
         fullres_width,
         rgb_full_width,
+        guarded_refinement=bool(exp.get("guarded_refinement", False)),
+        residual_depth_limit=float(exp.get("residual_depth_limit", 0.05)),
+        residual_normal_limit=float(exp.get("residual_normal_limit", 0.15)),
+        grayscale_refinement=bool(exp.get("grayscale_refinement", False)),
     ).to(device)
-    objective = GeometryObjective(exp["depth_mode"]).to(device)
+    objective = GeometryObjective(exp["depth_mode"], auxiliary_weight=auxiliary_weight).to(device)
     init_checkpoint = exp.get("init_checkpoint")
     if init_checkpoint and not (run_dir / "last_checkpoint.pt").is_file():
         init_checkpoint = Path(init_checkpoint)
@@ -248,13 +253,16 @@ def main():
     with torch.inference_mode():
         audit_input = torch.zeros(audit_batch_size, 3, *exp["input_size"], device=device)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(exp["amp"])):
-            result = model(audit_input)
+            result = model(audit_input, return_coarse=auxiliary_weight > 0)
         torch.cuda.synchronize(device)
     height, width = (int(size) for size in exp["input_size"])
-    if [tuple(item.shape) for item in result] != [
+    expected_shapes = [
         (audit_batch_size, 1, height, width),
         (audit_batch_size, 3, height, width),
-    ]:
+    ]
+    if auxiliary_weight:
+        expected_shapes += expected_shapes
+    if [tuple(item.shape) for item in result] != expected_shapes:
         raise RuntimeError("Model output shape audit failed")
     print("Model output-shape audit passed.", flush=True)
     print(f"Model={exp['backbone']} parameters={parameter_count / 1e6:.2f}M FPN={exp['fpn_width']} fusion={fpn_fusion} refinement={decoder_refinement}:stride2={refinement_width}:fullres={fullres_width} targets=depth+normals", flush=True)
@@ -350,6 +358,8 @@ def main():
             else:
                 train_totals = []
                 task_totals = {"depth_loss": [], "normal_loss": []}
+                if auxiliary_weight:
+                    task_totals.update({"coarse_depth_loss": [], "coarse_normal_loss": []})
                 epoch_order = [(index, (seed + epoch * 1_000_003 + index) % (2**32)) for index in range(len(datasets["train"]))]
                 random.Random(seed + epoch).shuffle(epoch_order)
                 resume_batch = 0
@@ -367,8 +377,12 @@ def main():
                 x, d, n, m = [item.to(device, non_blocking=True) for item in (x, d, n, m)]
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(exp["amp"])):
-                    predicted_depth, predicted_normal = model(x)
-                    loss, parts = objective(predicted_depth, d, predicted_normal, n, m)
+                    predictions = model(x, return_coarse=auxiliary_weight > 0)
+                    predicted_depth, predicted_normal = predictions[:2]
+                    coarse_depth, coarse_normal = predictions[2:] if auxiliary_weight else (None, None)
+                    loss, parts = objective(
+                        predicted_depth, d, predicted_normal, n, m, coarse_depth, coarse_normal
+                    )
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite loss at epoch={epoch + 1}, batch={batch_index + 1}")
                 scaler.scale(loss).backward()
@@ -382,11 +396,15 @@ def main():
                 completed = batch_index + 1
                 memory = torch.cuda.memory_allocated(device) / 2**30
                 peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
-                progress.set_postfix(iteration=f"{completed}/{train_steps}", loss=f"{float(loss.detach()):.4f}", depth=f"{float(parts['depth_loss']):.4f}", normal=f"{float(parts['normal_loss']):.4f}", gpu_mem=f"{memory:.1f}GiB", data_s=f"{current_wait:.2f}", refresh=False)
+                postfix = {"iteration": f"{completed}/{train_steps}", "loss": f"{float(loss.detach()):.4f}", "depth": f"{float(parts['depth_loss']):.4f}", "normal": f"{float(parts['normal_loss']):.4f}", "gpu_mem": f"{memory:.1f}GiB", "data_s": f"{current_wait:.2f}"}
+                if auxiliary_weight:
+                    postfix.update(coarse_depth=f"{float(parts['coarse_depth_loss']):.4f}", coarse_normal=f"{float(parts['coarse_normal_loss']):.4f}")
+                progress.set_postfix(**postfix, refresh=False)
                 if completed % int(exp["progress_json_interval_steps"]) == 0:
                     atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "batches_complete": completed, "batches_total": train_steps, "latest_train_loss": train_totals[-1], "last_update_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
                 if completed % int(exp["log_interval_steps"]) == 0:
-                    print(f"epoch {epoch + 1:03d}/{exp['epochs']} batch {completed}/{train_steps} loss={train_totals[-1]:.4f} depth={float(parts['depth_loss']):.4f} normal={float(parts['normal_loss']):.4f} data_wait={current_wait:.2f}s gpu_mem={memory:.2f}GiB gpu_peak={peak_memory:.2f}GiB memory={process_memory_gib()}", flush=True)
+                    coarse_log = (f" coarse_depth={float(parts['coarse_depth_loss']):.4f} coarse_normal={float(parts['coarse_normal_loss']):.4f}" if auxiliary_weight else "")
+                    print(f"epoch {epoch + 1:03d}/{exp['epochs']} batch {completed}/{train_steps} loss={train_totals[-1]:.4f} depth={float(parts['depth_loss']):.4f} normal={float(parts['normal_loss']):.4f}{coarse_log} data_wait={current_wait:.2f}s gpu_mem={memory:.2f}GiB gpu_peak={peak_memory:.2f}GiB memory={process_memory_gib()}", flush=True)
                 if stop_requested:
                     stage["name"] = f"epoch {epoch + 1} batch {completed} checkpoint"
                     save_checkpoint(last_checkpoint, state_payload(epoch, completed, epoch_order, train_totals, task_totals, prior_seconds + time.perf_counter() - epoch_start))
@@ -405,7 +423,7 @@ def main():
             torch.cuda.synchronize()
             train_seconds = prior_seconds + time.perf_counter() - epoch_start
             val_start = time.perf_counter()
-            val_metrics = evaluate(model, loaders["val"], device)
+            val_metrics = evaluate(model, loaders["val"], device, detail_metrics=bool(exp.get("detail_metrics", False)))
             torch.cuda.synchronize()
             val_seconds = time.perf_counter() - val_start
             preview_x, preview_d, preview_n, preview_m = next(iter(loaders["val"]))
@@ -449,7 +467,7 @@ def main():
             shutil.copy2(last_checkpoint, checkpoint)
         best_state = torch.load(checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(best_state["model"])
-        test_metrics = evaluate(model, loaders["test"], device)
+        test_metrics = evaluate(model, loaders["test"], device, detail_metrics=bool(exp.get("detail_metrics", False)))
         atomic_json(run_dir / "test_metrics.json", test_metrics)
         remote_backup(run_dir / "test_metrics.json", output_cfg.get("backup_remote", ""))
         print("Held-out test metrics:", json.dumps(test_metrics, indent=2), flush=True)

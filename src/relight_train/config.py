@@ -28,6 +28,14 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("depth_mode must be metric or relative")
     if exp.get("decoder_refinement", "none") not in ("none", "stride2", "fullres"):
         raise ValueError("decoder_refinement must be none, stride2, or fullres")
+    if exp.get("guarded_refinement", False) and exp.get("decoder_refinement") != "fullres":
+        raise ValueError("guarded_refinement requires fullres decoder_refinement")
+    if float(exp.get("auxiliary_loss_weight", 0.0)) < 0:
+        raise ValueError("auxiliary_loss_weight must be nonnegative")
+    if float(exp.get("residual_depth_limit", 0.05)) <= 0:
+        raise ValueError("residual_depth_limit must be positive")
+    if not 0 < float(exp.get("residual_normal_limit", 0.15)) < 1:
+        raise ValueError("residual_normal_limit must be between 0 and 1")
     if int(exp.get("refinement_width", 16)) < 1:
         raise ValueError("refinement_width must be positive")
     if int(exp.get("fullres_width", 24)) < 1 or int(exp.get("rgb_full_width", 8)) < 1:

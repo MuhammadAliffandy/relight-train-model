@@ -138,8 +138,9 @@ class Stride2GeometryRefinement(nn.Module):
 
 class FullResolutionGeometryRefinement(nn.Module):
     """Progressively refine fused FPN features at stride-2 and input resolution."""
-    def __init__(self, fpn_width, stride2_width=48, fullres_width=24, rgb_full_width=8):
+    def __init__(self, fpn_width, stride2_width=48, fullres_width=24, rgb_full_width=8, grayscale_rgb=False):
         super().__init__()
+        self.grayscale_rgb = grayscale_rgb
         self.rgb_half_stem = nn.Sequential(
             nn.Conv2d(3, 16, 3, padding=1, bias=False),
             nn.BatchNorm2d(16),
@@ -175,6 +176,12 @@ class FullResolutionGeometryRefinement(nn.Module):
         nn.init.zeros_(self.normal_delta.bias)
 
     def forward(self, image, fused, depth_coarse, normal_coarse, size):
+        if self.grayscale_rgb:
+            red = image[:, 0:1] * 0.229 + 0.485
+            green = image[:, 1:2] * 0.224 + 0.456
+            blue = image[:, 2:3] * 0.225 + 0.406
+            luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+            image = ((luminance - 0.459) / 0.226).expand(-1, 3, -1, -1)
         stride2_size = (size[0] // 2, size[1] // 2)
         coarse_stride2 = F.interpolate(
             torch.cat((depth_coarse, normal_coarse), dim=1),
@@ -224,6 +231,10 @@ class PortraitGeometryModel(nn.Module):
         refinement_width=16,
         fullres_width=24,
         rgb_full_width=8,
+        guarded_refinement=False,
+        residual_depth_limit=0.05,
+        residual_normal_limit=0.15,
+        grayscale_refinement=False,
     ):
         super().__init__()
         if backbone == "fastvit_t8.apple_in1k":
@@ -239,6 +250,11 @@ class PortraitGeometryModel(nn.Module):
         if decoder_refinement not in ("none", "stride2", "fullres"):
             raise ValueError("decoder_refinement must be 'none', 'stride2', or 'fullres'.")
         self.decoder_refinement = decoder_refinement
+        self.guarded_refinement = guarded_refinement
+        self.residual_depth_limit = residual_depth_limit
+        self.residual_normal_limit = residual_normal_limit
+        if guarded_refinement and decoder_refinement != "fullres":
+            raise ValueError("guarded_refinement requires fullres decoder_refinement")
         if decoder_refinement == "stride2":
             self.refinement = Stride2GeometryRefinement(fpn_width, width=refinement_width)
         elif decoder_refinement == "fullres":
@@ -248,9 +264,10 @@ class PortraitGeometryModel(nn.Module):
                 stride2_width=refinement_width,
                 fullres_width=fullres_width,
                 rgb_full_width=rgb_full_width,
+                grayscale_rgb=grayscale_refinement,
             )
 
-    def forward(self, x):
+    def forward(self, x, return_coarse=False):
         output_size = x.shape[-2:]
         fused = self.neck(self.encoder(x))
         if self.decoder_refinement == "fullres":
@@ -263,6 +280,11 @@ class PortraitGeometryModel(nn.Module):
         )
         normal_raw_full = F.interpolate(
             normal_raw, size=output_size, mode="bilinear", align_corners=False
+        )
+        coarse_depth = F.softplus(depth_logits_full) if return_coarse else None
+        coarse_normal = (
+            F.normalize(normal_raw_full, p=2, dim=1, eps=1e-6)
+            if return_coarse or self.guarded_refinement else None
         )
 
         if self.decoder_refinement == "stride2":
@@ -284,11 +306,22 @@ class PortraitGeometryModel(nn.Module):
             )
         elif self.decoder_refinement == "fullres":
             depth_delta, normal_delta = self.refinement(
-                x, fused, depth_raw, normal_raw, output_size
+                x,
+                fused.detach() if self.guarded_refinement else fused,
+                depth_raw.detach() if self.guarded_refinement else depth_raw,
+                normal_raw.detach() if self.guarded_refinement else normal_raw,
+                output_size,
             )
+            if self.guarded_refinement:
+                depth_delta = self.residual_depth_limit * torch.tanh(depth_delta)
+                normal_magnitude = torch.linalg.vector_norm(normal_delta, dim=1, keepdim=True).clamp_min(1e-6)
+                normal_delta = self.residual_normal_limit * torch.tanh(normal_magnitude) * normal_delta / normal_magnitude
+                normal_raw_full = coarse_normal
             depth_logits_full = depth_logits_full + depth_delta
             normal_raw_full = normal_raw_full + normal_delta
 
         depth = F.softplus(depth_logits_full)
         normals = F.normalize(normal_raw_full, p=2, dim=1, eps=1e-6)
+        if return_coarse:
+            return depth, normals, coarse_depth, coarse_normal
         return depth, normals
