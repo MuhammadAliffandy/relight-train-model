@@ -44,6 +44,19 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("init_mode must be full or encoder_only")
     if int(exp.get("batch_size", 0)) < 1 or int(exp.get("epochs", 0)) < 1:
         raise ValueError("batch_size and epochs must be positive")
+    domain_augmentation = exp.get("domain_augmentation")
+    if domain_augmentation is not None:
+        if not isinstance(domain_augmentation, dict):
+            raise ValueError("domain_augmentation must be a mapping")
+        for key in ("background_probability", "crop_probability", "head_crop_fraction", "jpeg_probability"):
+            value = float(domain_augmentation.get(key, 0))
+            if not 0 <= value <= 1:
+                raise ValueError(f"domain_augmentation.{key} must be between 0 and 1")
+        jpeg_quality = domain_augmentation.get("jpeg_quality", [75, 95])
+        if not isinstance(jpeg_quality, (list, tuple)) or len(jpeg_quality) != 2 or not 1 <= int(jpeg_quality[0]) <= int(jpeg_quality[1]) <= 100:
+            raise ValueError("domain_augmentation.jpeg_quality must be [minimum, maximum] within 1-100")
+        if int(domain_augmentation.get("minimum_person_height", 64)) < 1:
+            raise ValueError("domain_augmentation.minimum_person_height must be positive")
     data["source_root"] = _expand_path(data["source_root"])
     data["inventory_dir"] = _expand_path(data["inventory_dir"])
     output["run_dir"] = _expand_path(output["run_dir"])

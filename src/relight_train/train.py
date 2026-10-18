@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 
 from relight_train.config import load_config
 from relight_train.data import RawSynthHumanDataset, build_raw_manifest
+from relight_train.domain_augmentation import DomainAugmentedDataset
 from relight_train.model import PortraitGeometryModel
 from relight_train.objectives import GeometryObjective, evaluate
 
@@ -116,8 +117,13 @@ def main():
     selection_sha256 = hashlib.sha256("\n".join(sorted(row["subject_id"] for row in rows)).encode("utf-8")).hexdigest()
     part_sizes = {key: len(value) for key, value in partitions.items()}
     print(f"Raw dataset manifest ready: {sum(part_sizes.values()):,} samples; split={part_sizes}; inventory={inventory}", flush=True)
+    domain_augmentation = exp.get("domain_augmentation")
     datasets = {
-        key: RawSynthHumanDataset(value, exp["input_size"], augment=(key == "train"))
+        key: (
+            DomainAugmentedDataset(value, exp["input_size"], domain_augmentation)
+            if key == "train" and domain_augmentation
+            else RawSynthHumanDataset(value, exp["input_size"], augment=(key == "train"))
+        )
         for key, value in partitions.items()
     }
     workers = int(exp["workers"])
@@ -127,7 +133,9 @@ def main():
     persistent_workers = workers > 0 and str(exp.get("decoder_refinement", "none")) != "fullres"
     loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, persistent_workers=persistent_workers, **loader_options) for key, value in datasets.items()}
     sample = datasets["train"][0]
-    image, depth, normal, mask = sample
+    image, depth, normal, mask = sample[:4]
+    if len(sample) == 5:
+        print(f"Domain augmentation active: {domain_augmentation}; depth supervision fraction={float(sample[4].mean()):.4f}", flush=True)
     valid_depth = depth[0][mask[0] > 0]
     print(f"Sample audit: RGB={tuple(image.shape)} depth_m={tuple(depth.shape)} normals={tuple(normal.shape)} mask={tuple(mask.shape)} depth_p01/p50/p99={torch.quantile(valid_depth, torch.tensor([.01,.5,.99])).tolist()} mask_fraction={float(mask.mean()):.4f}", flush=True)
     if any(size == 0 for size in part_sizes.values()):
@@ -370,18 +378,22 @@ def main():
             data_wait = 0.0
             progress = tqdm(loader, total=train_steps, initial=resume_batch, desc=f"Epoch {epoch + 1}/{exp['epochs']}", unit="batch", dynamic_ncols=True)
             stage["name"] = f"epoch {epoch + 1} waiting for batch {resume_batch + 1}"
-            for batch_index, (x, d, n, m) in enumerate(progress, start=resume_batch):
+            for batch_index, batch in enumerate(progress, start=resume_batch):
                 stage["name"] = f"epoch {epoch + 1} batch {batch_index + 1} forward/backward"
                 current_wait = time.perf_counter() - last_batch_end
                 data_wait += current_wait
+                x, d, n, m = batch[:4]
+                depth_mask = batch[4] if len(batch) == 5 else m
                 x, d, n, m = [item.to(device, non_blocking=True) for item in (x, d, n, m)]
+                depth_mask = depth_mask.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(exp["amp"])):
                     predictions = model(x, return_coarse=auxiliary_weight > 0)
                     predicted_depth, predicted_normal = predictions[:2]
                     coarse_depth, coarse_normal = predictions[2:] if auxiliary_weight else (None, None)
                     loss, parts = objective(
-                        predicted_depth, d, predicted_normal, n, m, coarse_depth, coarse_normal
+                        predicted_depth, d, predicted_normal, n, m, coarse_depth, coarse_normal,
+                        depth_mask=depth_mask,
                     )
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite loss at epoch={epoch + 1}, batch={batch_index + 1}")

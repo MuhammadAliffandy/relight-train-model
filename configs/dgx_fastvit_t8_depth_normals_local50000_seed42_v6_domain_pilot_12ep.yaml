@@ -1,0 +1,50 @@
+experiment:
+  name: fastvit_t8_fpn72_v6_domain_pilot_50k_seed42_384x512_12ep
+  seed: 42
+  epochs: 12
+  batch_size: 8
+  workers: 2
+  prefetch_factor: 1
+  input_size: [384, 512]
+  backbone: fastvit_t8.apple_in1k
+  pretrained: false
+  fpn_width: 72
+  fpn_fusion: concat
+  depth_mode: metric
+  decoder_refinement: fullres
+  refinement_width: 48
+  fullres_width: 24
+  rgb_full_width: 8
+  auxiliary_loss_weight: 0.5
+  guarded_refinement: true
+  residual_depth_limit: 0.05
+  residual_normal_limit: 0.15
+  grayscale_refinement: true
+  init_checkpoint: ./runs/fastvit_t8_fpn72_guarded_aux_50k_seed42_384x512_100ep/best_checkpoint.pt
+  init_mode: full
+  learning_rate: 0.00002
+  encoder_learning_rate: 0.000005
+  min_learning_rate: 0.0000001
+  scheduler: cosine
+  weight_decay: 0.0001
+  checkpoint_interval_minutes: 10
+  log_interval_steps: 10
+  progress_json_interval_steps: 10
+  amp: true
+  domain_augmentation:
+    background_probability: 0.35
+    jpeg_probability: 0.30
+    jpeg_quality: [75, 95]
+    crop_probability: 0.35
+    head_crop_fraction: 0.40
+    minimum_person_height: 64
+
+data:
+  rclone_source: xxdrive:AppleCapstoneRelighting/dataset/sources/SynthHuman
+  source_root: ./data/synthhuman_local30000/raw
+  expected_samples: 50000
+  inventory_dir: ./data/synthhuman_local30000/index
+
+output:
+  run_dir: ./runs/fastvit_t8_fpn72_v6_domain_pilot_50k_seed42_384x512_12ep
+  backup_remote: ""

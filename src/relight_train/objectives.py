@@ -16,40 +16,45 @@ class GeometryObjective(nn.Module):
     def masked_mean(value, mask):
         return (value * mask).sum() / mask.sum().clamp_min(1.0)
 
-    def geometry_losses(self, predicted_depth, target_depth, predicted_normal, target_normal, mask):
+    def geometry_losses(self, predicted_depth, target_depth, predicted_normal, target_normal, mask,
+                        depth_mask=None):
+        depth_mask = mask if depth_mask is None else depth_mask
         if self.depth_mode == "relative":
             pred = predicted_depth.clamp_min(1e-5).log().clone()
             target = target_depth.clamp_min(1e-5).log().clone()
             for batch in range(pred.shape[0]):
-                valid = mask[batch, 0].bool()
+                valid = depth_mask[batch, 0].bool()
                 if not valid.any():
-                    raise ValueError("A sample has an empty valid mask")
+                    continue
                 pred[batch] -= torch.median(pred[batch, 0][valid])
                 target[batch] -= torch.median(target[batch, 0][valid])
-            depth_loss = self.masked_mean(F.smooth_l1_loss(pred, target, reduction="none"), mask)
+            depth_loss = self.masked_mean(F.smooth_l1_loss(pred, target, reduction="none"), depth_mask)
         else:
-            depth_loss = self.masked_mean(F.smooth_l1_loss(predicted_depth, target_depth, reduction="none"), mask)
+            depth_loss = self.masked_mean(F.smooth_l1_loss(predicted_depth, target_depth, reduction="none"), depth_mask)
         cosine = (F.normalize(predicted_normal, dim=1, eps=1e-6) * F.normalize(target_normal, dim=1, eps=1e-6)).sum(1, keepdim=True).clamp(-1, 1)
         normal_loss = self.masked_mean(1 - cosine, mask)
         return depth_loss, normal_loss
 
     def forward(self, predicted_depth, target_depth, predicted_normal, target_normal, mask,
-                coarse_depth=None, coarse_normal=None):
+                coarse_depth=None, coarse_normal=None, depth_mask=None):
+        depth_mask = mask if depth_mask is None else depth_mask
         depth_loss, normal_loss = self.geometry_losses(
-            predicted_depth, target_depth, predicted_normal, target_normal, mask
+            predicted_depth, target_depth, predicted_normal, target_normal, mask, depth_mask
         )
         parts = {"depth_loss": depth_loss.detach(), "normal_loss": normal_loss.detach()}
         if self.auxiliary_weight:
             if coarse_depth is None or coarse_normal is None:
                 raise ValueError("Auxiliary loss requires both coarse predictions")
             coarse_depth_loss, coarse_normal_loss = self.geometry_losses(
-                coarse_depth, target_depth, coarse_normal, target_normal, mask
+                coarse_depth, target_depth, coarse_normal, target_normal, mask, depth_mask
             )
             depth_loss = depth_loss + self.auxiliary_weight * coarse_depth_loss
             normal_loss = normal_loss + self.auxiliary_weight * coarse_normal_loss
             parts.update({"coarse_depth_loss": coarse_depth_loss.detach(),
                           "coarse_normal_loss": coarse_normal_loss.detach()})
-        total = sum(torch.exp(-self.log_vars[i]) * loss + self.log_vars[i] for i, loss in enumerate((depth_loss, normal_loss)))
+        depth_term = torch.exp(-self.log_vars[0]) * depth_loss + self.log_vars[0]
+        normal_term = torch.exp(-self.log_vars[1]) * normal_loss + self.log_vars[1]
+        total = torch.where(depth_mask.sum() > 0, depth_term, depth_term * 0) + normal_term
         return total, parts
 
 
