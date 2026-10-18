@@ -97,3 +97,20 @@ CUDA_VISIBLE_DEVICES=0 nohup ./scripts/train_dgx.sh configs/dgx_fastvit_t8_depth
 ```
 
 This local-copy option uses rclone only for staging; training reads the copied files from the project disk. The separate 50k streaming path still uses the rclone mount and its bounded VFS cache on `/raid`.
+
+## V7 geometry fine-tune from V6
+
+`configs/dgx_fastvit_t8_depth_normals_local50000_seed42_v7_geometry_12ep.yaml` starts a separate 12-epoch run from the V6 `best_checkpoint.pt`. It keeps the V6 architecture and domain augmentation, with a smaller encoder learning rate. Full-frame images retain metric depth supervision. Crops gain a scale-invariant log-depth shape loss, so the zoomed crop does not force an absolute-distance target. Mask-valid depth gradients and GT-normal boundaries also receive small extra weights. The existing coarse-output auxiliary loss remains active.
+
+Run this after the V6 checkpoint exists and the V6 process has released the GPU:
+
+```bash
+cd ~/raid/Clara/relight-train-model
+git pull --ff-only origin main
+mkdir -p logs
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 nohup bash scripts/train_dgx.sh \
+  configs/dgx_fastvit_t8_depth_normals_local50000_seed42_v7_geometry_12ep.yaml \
+  > logs/v7_geometry_launcher.log 2>&1 < /dev/null &
+```
+
+The launcher prints the timestamped training log path; `tail -f logs/v7_geometry_launcher.log` shows startup errors, and `./scripts/tail_train.sh` follows the training log. Compare V6 and V7 on the same held-out samples and real photos, with identical preprocessing, masks, and depth color scales. The V7 validation history also records depth-edge, normal-boundary, and scale-invariant depth metrics.

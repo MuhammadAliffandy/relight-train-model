@@ -6,15 +6,63 @@ import torch.nn.functional as F
 
 
 class GeometryObjective(nn.Module):
-    def __init__(self, depth_mode="metric", auxiliary_weight=0.0):
+    def __init__(self, depth_mode="metric", auxiliary_weight=0.0, crop_depth_shape_weight=0.0,
+                 depth_gradient_weight=0.0, normal_edge_weight=0.0):
         super().__init__()
         self.depth_mode = depth_mode
         self.auxiliary_weight = float(auxiliary_weight)
+        self.crop_depth_shape_weight = float(crop_depth_shape_weight)
+        self.depth_gradient_weight = float(depth_gradient_weight)
+        self.normal_edge_weight = float(normal_edge_weight)
         self.log_vars = nn.Parameter(torch.zeros(2))
 
     @staticmethod
     def masked_mean(value, mask):
         return (value * mask).sum() / mask.sum().clamp_min(1.0)
+
+    @staticmethod
+    def crop_depth_shape_loss(predicted_depth, target_depth, mask, depth_mask):
+        cropped = depth_mask.flatten(1).sum(1) == 0
+        interior = F.avg_pool2d(mask.float(), 5, stride=1, padding=2) == 1
+        valid = interior & (target_depth > 0) & cropped[:, None, None, None]
+        predicted_log = predicted_depth.float().clamp_min(1e-5).log()
+        target_log = target_depth.float().clamp_min(1e-5).log()
+        difference = predicted_log - target_log
+        counts = valid.flatten(1).sum(1).clamp_min(1)
+        offsets = (difference * valid).flatten(1).sum(1) / counts
+        centered = difference - offsets[:, None, None, None]
+        per_image = (F.smooth_l1_loss(centered, torch.zeros_like(centered), reduction="none", beta=0.1)
+                     * valid).flatten(1).sum(1) / counts
+        return (per_image * cropped).sum() / cropped.sum().clamp_min(1)
+
+    @staticmethod
+    def depth_gradient_loss(predicted_depth, target_depth, mask):
+        predicted_log = predicted_depth.float().clamp_min(1e-5).log()
+        target_log = target_depth.float().clamp_min(1e-5).log()
+        interior = F.avg_pool2d(mask.float(), 5, stride=1, padding=2) == 1
+        valid = interior & (target_depth > 0)
+        horizontal = valid[:, :, :, 1:] & valid[:, :, :, :-1]
+        vertical = valid[:, :, 1:, :] & valid[:, :, :-1, :]
+        horizontal_error = (predicted_log[:, :, :, 1:] - predicted_log[:, :, :, :-1]
+                            - target_log[:, :, :, 1:] + target_log[:, :, :, :-1])
+        vertical_error = (predicted_log[:, :, 1:, :] - predicted_log[:, :, :-1, :]
+                          - target_log[:, :, 1:, :] + target_log[:, :, :-1, :])
+        horizontal_loss = F.smooth_l1_loss(horizontal_error, torch.zeros_like(horizontal_error),
+                                           reduction="none", beta=0.05)
+        vertical_loss = F.smooth_l1_loss(vertical_error, torch.zeros_like(vertical_error),
+                                         reduction="none", beta=0.05)
+        return ((horizontal_loss * horizontal).sum() + (vertical_loss * vertical).sum()) / (
+            horizontal.sum() + vertical.sum()).clamp_min(1)
+
+    @staticmethod
+    def normal_edge_loss(predicted_normal, target_normal, mask):
+        target_unit = F.normalize(target_normal.float(), dim=1, eps=1e-6)
+        predicted_unit = F.normalize(predicted_normal.float(), dim=1, eps=1e-6)
+        cosine = (target_unit * predicted_unit).sum(1, keepdim=True).clamp(-1, 1)
+        interior = F.avg_pool2d(mask.float(), 3, stride=1, padding=1) == 1
+        strength = (sobel_magnitude(target_unit * mask)[:, None] / 0.15).clamp(0, 1)
+        weights = (strength * interior).detach()
+        return ((1 - cosine) * weights).sum() / weights.sum().clamp_min(1)
 
     def geometry_losses(self, predicted_depth, target_depth, predicted_normal, target_normal, mask,
                         depth_mask=None):
@@ -52,9 +100,32 @@ class GeometryObjective(nn.Module):
             normal_loss = normal_loss + self.auxiliary_weight * coarse_normal_loss
             parts.update({"coarse_depth_loss": coarse_depth_loss.detach(),
                           "coarse_normal_loss": coarse_normal_loss.detach()})
+        if self.crop_depth_shape_weight:
+            crop_shape_loss = self.crop_depth_shape_loss(
+                predicted_depth, target_depth, mask, depth_mask
+            )
+            depth_loss = depth_loss + self.crop_depth_shape_weight * crop_shape_loss
+            parts["crop_depth_shape_loss"] = crop_shape_loss.detach()
+            if self.auxiliary_weight:
+                coarse_crop_shape_loss = self.crop_depth_shape_loss(
+                    coarse_depth, target_depth, mask, depth_mask
+                )
+                depth_loss = depth_loss + self.crop_depth_shape_weight * self.auxiliary_weight * coarse_crop_shape_loss
+                parts["coarse_crop_depth_shape_loss"] = coarse_crop_shape_loss.detach()
+        if self.depth_gradient_weight:
+            gradient_loss = self.depth_gradient_loss(predicted_depth, target_depth, mask)
+            depth_loss = depth_loss + self.depth_gradient_weight * gradient_loss
+            parts["depth_gradient_loss"] = gradient_loss.detach()
+        if self.normal_edge_weight:
+            edge_loss = self.normal_edge_loss(predicted_normal, target_normal, mask)
+            normal_loss = normal_loss + self.normal_edge_weight * edge_loss
+            parts["normal_edge_loss"] = edge_loss.detach()
         depth_term = torch.exp(-self.log_vars[0]) * depth_loss + self.log_vars[0]
         normal_term = torch.exp(-self.log_vars[1]) * normal_loss + self.log_vars[1]
-        total = torch.where(depth_mask.sum() > 0, depth_term, depth_term * 0) + normal_term
+        has_depth_supervision = depth_mask.sum() > 0
+        if self.crop_depth_shape_weight or self.depth_gradient_weight:
+            has_depth_supervision = has_depth_supervision | (mask.sum() > 0)
+        total = torch.where(has_depth_supervision, depth_term, depth_term * 0) + normal_term
         return total, parts
 
 

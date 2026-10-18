@@ -161,7 +161,13 @@ def main():
         residual_normal_limit=float(exp.get("residual_normal_limit", 0.15)),
         grayscale_refinement=bool(exp.get("grayscale_refinement", False)),
     ).to(device)
-    objective = GeometryObjective(exp["depth_mode"], auxiliary_weight=auxiliary_weight).to(device)
+    objective = GeometryObjective(
+        exp["depth_mode"],
+        auxiliary_weight=auxiliary_weight,
+        crop_depth_shape_weight=float(exp.get("crop_depth_shape_weight", 0.0)),
+        depth_gradient_weight=float(exp.get("depth_gradient_weight", 0.0)),
+        normal_edge_weight=float(exp.get("normal_edge_weight", 0.0)),
+    ).to(device)
     init_checkpoint = exp.get("init_checkpoint")
     if init_checkpoint and not (run_dir / "last_checkpoint.pt").is_file():
         init_checkpoint = Path(init_checkpoint)
@@ -404,19 +410,30 @@ def main():
                 scaler.update()
                 train_totals.append(float(loss.detach()))
                 for key, value in parts.items():
-                    task_totals[key].append(float(value))
+                    task_totals.setdefault(key, []).append(float(value))
                 completed = batch_index + 1
                 memory = torch.cuda.memory_allocated(device) / 2**30
                 peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
                 postfix = {"iteration": f"{completed}/{train_steps}", "loss": f"{float(loss.detach()):.4f}", "depth": f"{float(parts['depth_loss']):.4f}", "normal": f"{float(parts['normal_loss']):.4f}", "gpu_mem": f"{memory:.1f}GiB", "data_s": f"{current_wait:.2f}"}
                 if auxiliary_weight:
                     postfix.update(coarse_depth=f"{float(parts['coarse_depth_loss']):.4f}", coarse_normal=f"{float(parts['coarse_normal_loss']):.4f}")
+                extra_loss_names = (
+                    "crop_depth_shape_loss", "coarse_crop_depth_shape_loss",
+                    "depth_gradient_loss", "normal_edge_loss",
+                )
+                for name in extra_loss_names:
+                    if name in parts:
+                        postfix[name.removesuffix("_loss")] = f"{float(parts[name]):.4f}"
                 progress.set_postfix(**postfix, refresh=False)
                 if completed % int(exp["progress_json_interval_steps"]) == 0:
                     atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "batches_complete": completed, "batches_total": train_steps, "latest_train_loss": train_totals[-1], "last_update_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
                 if completed % int(exp["log_interval_steps"]) == 0:
                     coarse_log = (f" coarse_depth={float(parts['coarse_depth_loss']):.4f} coarse_normal={float(parts['coarse_normal_loss']):.4f}" if auxiliary_weight else "")
-                    print(f"epoch {epoch + 1:03d}/{exp['epochs']} batch {completed}/{train_steps} loss={train_totals[-1]:.4f} depth={float(parts['depth_loss']):.4f} normal={float(parts['normal_loss']):.4f}{coarse_log} data_wait={current_wait:.2f}s gpu_mem={memory:.2f}GiB gpu_peak={peak_memory:.2f}GiB memory={process_memory_gib()}", flush=True)
+                    extra_log = "".join(
+                        f" {name.removesuffix('_loss')}={float(parts[name]):.4f}"
+                        for name in extra_loss_names if name in parts
+                    )
+                    print(f"epoch {epoch + 1:03d}/{exp['epochs']} batch {completed}/{train_steps} loss={train_totals[-1]:.4f} depth={float(parts['depth_loss']):.4f} normal={float(parts['normal_loss']):.4f}{coarse_log}{extra_log} data_wait={current_wait:.2f}s gpu_mem={memory:.2f}GiB gpu_peak={peak_memory:.2f}GiB memory={process_memory_gib()}", flush=True)
                 if stop_requested:
                     stage["name"] = f"epoch {epoch + 1} batch {completed} checkpoint"
                     save_checkpoint(last_checkpoint, state_payload(epoch, completed, epoch_order, train_totals, task_totals, prior_seconds + time.perf_counter() - epoch_start))

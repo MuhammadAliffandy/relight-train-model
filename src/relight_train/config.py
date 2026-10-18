@@ -32,6 +32,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("guarded_refinement requires fullres decoder_refinement")
     if float(exp.get("auxiliary_loss_weight", 0.0)) < 0:
         raise ValueError("auxiliary_loss_weight must be nonnegative")
+    for key in ("crop_depth_shape_weight", "depth_gradient_weight", "normal_edge_weight"):
+        if float(exp.get(key, 0.0)) < 0:
+            raise ValueError(f"{key} must be nonnegative")
     if float(exp.get("residual_depth_limit", 0.05)) <= 0:
         raise ValueError("residual_depth_limit must be positive")
     if not 0 < float(exp.get("residual_normal_limit", 0.15)) < 1:
