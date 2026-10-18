@@ -47,6 +47,17 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("init_mode must be full or encoder_only")
     if int(exp.get("batch_size", 0)) < 1 or int(exp.get("epochs", 0)) < 1:
         raise ValueError("batch_size and epochs must be positive")
+    early_stopping = exp.get("early_stopping")
+    if early_stopping is not None:
+        if not isinstance(early_stopping, dict):
+            raise ValueError("early_stopping must be a mapping")
+        if int(early_stopping.get("patience", 0)) < 1:
+            raise ValueError("early_stopping.patience must be positive")
+        minimum_epochs = int(early_stopping.get("min_epochs", 1))
+        if not 1 <= minimum_epochs <= int(exp["epochs"]):
+            raise ValueError("early_stopping.min_epochs must be between 1 and epochs")
+        if float(early_stopping.get("min_delta", 0.0)) < 0:
+            raise ValueError("early_stopping.min_delta must be nonnegative")
     domain_augmentation = exp.get("domain_augmentation")
     if domain_augmentation is not None:
         if not isinstance(domain_augmentation, dict):

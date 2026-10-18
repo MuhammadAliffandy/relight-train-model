@@ -318,6 +318,10 @@ def main():
     resume_task_totals = {}
     resume_train_seconds = 0.0
     best_score = float("inf")
+    early_stopping = exp.get("early_stopping")
+    early_stop_reference_score = float("inf")
+    stale_epochs = 0
+    early_stopped = False
     if last_checkpoint.is_file():
         state = torch.load(last_checkpoint, map_location=device, weights_only=False)
         if state.get("selection_sha256") != selection_sha256:
@@ -331,6 +335,9 @@ def main():
         resume_batch = state.get("batch_in_epoch", 0)
         resume_order = state.get("epoch_order")
         best_score = state.get("best_score", float("inf"))
+        early_stop_reference_score = state.get("early_stop_reference_score", best_score)
+        stale_epochs = int(state.get("stale_epochs", 0))
+        early_stopped = bool(state.get("early_stopped", False))
         history = state.get("history", [])
         resume_train_totals = state.get("partial_train_totals", [])
         resume_task_totals = state.get("partial_task_totals", {})
@@ -349,17 +356,20 @@ def main():
                     f"for {visible_gpus} visible GPUs.",
                     flush=True,
                 )
-        print(f"Resuming at epoch {start_epoch + 1}, after {resume_batch} completed batches.", flush=True)
+        if not early_stopped:
+            print(f"Resuming at epoch {start_epoch + 1}, after {resume_batch} completed batches.", flush=True)
 
     train_steps = math.ceil(part_sizes["train"] / int(exp["batch_size"]))
     total_steps = train_steps * int(exp["epochs"])
     print(f"Run plan: epochs={exp['epochs']} batch={exp['batch_size']} steps/epoch={train_steps:,} max_steps={total_steps:,} output={run_dir}", flush=True)
+    if early_stopped:
+        print("Early stopping was already reached in this run; evaluating its best checkpoint.", flush=True)
 
     def state_payload(epoch, batch, order, train_values, task_values, elapsed):
-        return {"epoch": epoch, "batch_in_epoch": batch, "epoch_order": order, "partial_train_totals": train_values, "partial_task_totals": task_values, "train_seconds_elapsed": elapsed, "model": model.state_dict(), "objective": objective.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(), "best_score": best_score, "history": history, "python_rng": random.getstate(), "numpy_rng": np.random.get_state(), "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all(), "selection_sha256": selection_sha256, "experiment": exp}
+        return {"epoch": epoch, "batch_in_epoch": batch, "epoch_order": order, "partial_train_totals": train_values, "partial_task_totals": task_values, "train_seconds_elapsed": elapsed, "model": model.state_dict(), "objective": objective.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(), "best_score": best_score, "early_stop_reference_score": early_stop_reference_score, "stale_epochs": stale_epochs, "early_stopped": early_stopped, "history": history, "python_rng": random.getstate(), "numpy_rng": np.random.get_state(), "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all(), "selection_sha256": selection_sha256, "experiment": exp}
 
     try:
-        for epoch in range(start_epoch, int(exp["epochs"])):
+        for epoch in range(start_epoch if not early_stopped else int(exp["epochs"]), int(exp["epochs"])):
             torch.cuda.synchronize()
             epoch_start = time.perf_counter()
             torch.cuda.reset_peak_memory_stats(device)
@@ -465,6 +475,8 @@ def main():
             sample_rate = part_sizes["train"] / max(train_seconds, 1e-6)
             eta = max(int(exp["epochs"]) - epoch - 1, 0) * epoch_seconds
             score = val_metrics["depth_rmse_m"] / 0.1 + val_metrics["normal_mean_deg"] / 30.0
+            if not math.isfinite(score):
+                raise FloatingPointError(f"Non-finite validation score at epoch {epoch + 1}: {score}")
             if scheduler_name == "cosine":
                 scheduler.step()
             else:
@@ -472,8 +484,23 @@ def main():
             improved = score < best_score
             if improved:
                 best_score = score
+            if early_stopping:
+                min_delta = float(early_stopping.get("min_delta", 0.0))
+                if score < early_stop_reference_score - min_delta:
+                    early_stop_reference_score = score
+                    stale_epochs = 0
+                elif epoch + 1 > int(early_stopping.get("min_epochs", 1)):
+                    stale_epochs += 1
+                early_stopped = (
+                    epoch + 1 > int(early_stopping.get("min_epochs", 1))
+                    and stale_epochs >= int(early_stopping["patience"])
+                )
             peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
             record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "selection_score": score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[-1]["lr"], "encoder_lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
+            if early_stopping:
+                record.update(early_stop_wait=stale_epochs,
+                              early_stop_reference_score=early_stop_reference_score,
+                              early_stopped=early_stopped)
             history.append(record)
             atomic_json(history_path, history)
             completed = state_payload(epoch + 1, 0, None, [], {}, 0.0)
@@ -484,13 +511,16 @@ def main():
                 save_checkpoint(checkpoint, completed)
                 remote_backup(checkpoint, output_cfg.get("backup_remote", ""))
             remote_backup(history_path, output_cfg.get("backup_remote", ""))
-            atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "status": "epoch_complete", "train_seconds": train_seconds, "validation_seconds": val_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "preview_matrix": str(preview_path)})
+            atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "status": "early_stopped" if early_stopped else "epoch_complete", "train_seconds": train_seconds, "validation_seconds": val_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "preview_matrix": str(preview_path), "early_stop_wait": stale_epochs})
             resume_batch = 0
             resume_order = None
             resume_train_totals = []
             resume_task_totals = {}
             resume_train_seconds = 0.0
             print(f"epoch {epoch + 1:03d}/{exp['epochs']} iterations={train_steps:,} train={record['train_loss']:.4f} val depth(RMSE m)={val_metrics['depth_rmse_m']:.4f} normal(mean°)={val_metrics['normal_mean_deg']:.2f} score={score:.4f} train={train_seconds / 60:.1f}m val={val_seconds / 60:.1f}m rate={sample_rate:.1f} samples/s ETA={eta / 60:.1f}m", flush=True)
+            if early_stopped:
+                print(f"Early stopping at epoch {epoch + 1}: validation score has not improved by {min_delta:.4f} for {stale_epochs} epochs; best checkpoint remains {checkpoint}.", flush=True)
+                break
 
         if not checkpoint.is_file() and last_checkpoint.is_file():
             shutil.copy2(last_checkpoint, checkpoint)
