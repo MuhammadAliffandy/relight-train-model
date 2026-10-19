@@ -13,6 +13,65 @@ from torch.utils.data import Dataset
 from relight_train.data import RawSynthHumanDataset, _resize_array
 
 
+def crop_person_arrays(rgb, depth, normal, mask, input_size, zoom):
+    height, width = input_size
+    crop_height = min(height, max(24, round(height / zoom)))
+    crop_width = min(width, max(24, round(crop_height * width / height)))
+    crop_height = min(height, max(18, round(crop_width * height / width)))
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        raise ValueError("Cannot crop a sample without valid person pixels")
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    bbox_height = y1 - y0
+    top_band = ys < y0 + max(1, round(0.28 * bbox_height))
+    center_x = float(np.median(xs[top_band])) if top_band.any() else float(np.median(xs))
+    left = max(0, min(width - crop_width, round(center_x - crop_width / 2)))
+    top = max(0, min(height - crop_height, round(y0 - 0.04 * bbox_height)))
+    right, bottom = left + crop_width, top + crop_height
+    return (
+        _resize_array(rgb[top:bottom, left:right], input_size),
+        _resize_array(depth[top:bottom, left:right], input_size),
+        _resize_array(normal[top:bottom, left:right], input_size),
+        _resize_array(mask[top:bottom, left:right].astype(np.uint8), input_size, True)[..., 0] > 0,
+    )
+
+
+class FixedCropDataset(Dataset):
+    """Deterministic head-anchored crop for validation and held-out evaluation."""
+
+    def __init__(self, rows, input_size, zoom):
+        self.base = RawSynthHumanDataset(rows, input_size, augment=False)
+        self.input_size = tuple(input_size)
+        self.zoom = float(zoom)
+
+    def __len__(self):
+        return len(self.base)
+
+    def close(self):
+        self.base.close()
+
+    def __getitem__(self, index):
+        image, depth, normal, mask = self.base[index]
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        rgb = np.clip(image.permute(1, 2, 0).numpy() * std + mean, 0, 1)
+        rgb, cropped_depth, cropped_normal, cropped_mask = crop_person_arrays(
+            rgb,
+            depth.permute(1, 2, 0).numpy(),
+            normal.permute(1, 2, 0).numpy(),
+            mask[0].numpy() > 0,
+            self.input_size,
+            self.zoom,
+        )
+        rgb = (np.clip(rgb, 0, 1) - mean) / std
+        image_tensor = torch.from_numpy(rgb.copy()).permute(2, 0, 1).float()
+        depth_tensor = torch.from_numpy(cropped_depth.copy()).permute(2, 0, 1).float()
+        normal_tensor = F.normalize(torch.from_numpy(cropped_normal.copy()).permute(2, 0, 1).float(), dim=0, eps=1e-6)
+        mask_tensor = torch.from_numpy(cropped_mask[None].copy().astype(np.float32))
+        mask_tensor *= (torch.linalg.vector_norm(normal_tensor, dim=0, keepdim=True) > 0).float()
+        return image_tensor, depth_tensor, normal_tensor, mask_tensor
+
+
 class DomainAugmentedDataset(Dataset):
     def __init__(self, rows, input_size, config):
         self.rows = rows
@@ -22,6 +81,9 @@ class DomainAugmentedDataset(Dataset):
 
     def __len__(self):
         return len(self.rows)
+
+    def close(self):
+        self.base.close()
 
     def __getitem__(self, index):
         augmentation_seed = None
@@ -66,21 +128,29 @@ class DomainAugmentedDataset(Dataset):
             y0, y1 = int(ys.min()), int(ys.max()) + 1
             bbox_height = y1 - y0
             if bbox_height >= int(self.config.get("minimum_person_height", 64)):
-                head_crop = rng.random() < float(self.config.get("head_crop_fraction", 0.4))
-                fraction_range = (0.28, 0.42) if head_crop else (0.58, 0.78)
-                crop_height = min(height, max(24, round(rng.uniform(*fraction_range) * bbox_height)))
-                crop_width = min(width, max(24, round(crop_height * width / height)))
-                crop_height = min(height, max(18, round(crop_width * height / width)))
-                top_band = ys < y0 + max(1, round(0.28 * bbox_height))
-                center_x = float(np.median(xs[top_band])) if top_band.any() else float(np.median(xs))
-                left = max(0, min(width - crop_width, round(center_x - crop_width / 2)))
-                top = max(0, min(height - crop_height, round(y0 - 0.04 * bbox_height)))
-                right, bottom = left + crop_width, top + crop_height
-                rgb = _resize_array(rgb[top:bottom, left:right], self.input_size)
-                depth = _resize_array(depth[top:bottom, left:right], self.input_size)
-                normal = _resize_array(normal[top:bottom, left:right], self.input_size)
-                mask = _resize_array(mask[top:bottom, left:right].astype(np.uint8), self.input_size, True)[..., 0] > 0
-                cropped = True
+                bands = self.config.get("crop_zoom_bands")
+                if bands:
+                    band = rng.choices(bands, weights=[float(item[2]) for item in bands], k=1)[0]
+                    zoom = rng.uniform(float(band[0]), float(band[1]))
+                    if round(height / zoom) >= int(self.config.get("minimum_crop_height", 96)):
+                        rgb, depth, normal, mask = crop_person_arrays(rgb, depth, normal, mask, self.input_size, zoom)
+                        cropped = True
+                else:
+                    head_crop = rng.random() < float(self.config.get("head_crop_fraction", 0.4))
+                    fraction_range = (0.28, 0.42) if head_crop else (0.58, 0.78)
+                    crop_height = min(height, max(24, round(rng.uniform(*fraction_range) * bbox_height)))
+                    crop_width = min(width, max(24, round(crop_height * width / height)))
+                    crop_height = min(height, max(18, round(crop_width * height / width)))
+                    top_band = ys < y0 + max(1, round(0.28 * bbox_height))
+                    center_x = float(np.median(xs[top_band])) if top_band.any() else float(np.median(xs))
+                    left = max(0, min(width - crop_width, round(center_x - crop_width / 2)))
+                    top = max(0, min(height - crop_height, round(y0 - 0.04 * bbox_height)))
+                    right, bottom = left + crop_width, top + crop_height
+                    rgb = _resize_array(rgb[top:bottom, left:right], self.input_size)
+                    depth = _resize_array(depth[top:bottom, left:right], self.input_size)
+                    normal = _resize_array(normal[top:bottom, left:right], self.input_size)
+                    mask = _resize_array(mask[top:bottom, left:right].astype(np.uint8), self.input_size, True)[..., 0] > 0
+                    cropped = True
 
         if rng.random() < float(self.config.get("jpeg_probability", 0)):
             low, high = (int(value) for value in self.config.get("jpeg_quality", (75, 95)))

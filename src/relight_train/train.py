@@ -21,7 +21,7 @@ from tqdm.auto import tqdm
 
 from relight_train.config import load_config
 from relight_train.data import RawSynthHumanDataset, build_raw_manifest
-from relight_train.domain_augmentation import DomainAugmentedDataset
+from relight_train.domain_augmentation import DomainAugmentedDataset, FixedCropDataset
 from relight_train.model import PortraitGeometryModel
 from relight_train.objectives import GeometryObjective, evaluate
 
@@ -132,6 +132,29 @@ def main():
         loader_options["prefetch_factor"] = int(exp.get("prefetch_factor", 2))
     persistent_workers = workers > 0 and str(exp.get("decoder_refinement", "none")) != "fullres"
     loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, persistent_workers=persistent_workers, **loader_options) for key, value in datasets.items()}
+    crop_validation = exp.get("crop_validation")
+    crop_datasets = {"val": {}, "test": {}}
+    crop_loaders = {"val": {}, "test": {}}
+    crop_eval_ids = {}
+    if crop_validation:
+        crop_count = int(crop_validation["samples"])
+        for partition_name in ("val", "test"):
+            source_rows = partitions[partition_name]
+            selected_indices = sorted(random.Random(seed + (71 if partition_name == "val" else 73)).sample(
+                range(len(source_rows)), min(crop_count, len(source_rows))
+            ))
+            crop_rows = [source_rows[index] for index in selected_indices]
+            crop_eval_ids[partition_name] = [row["subject_id"] for row in crop_rows]
+            for zoom in crop_validation["zooms"]:
+                label = f"{float(zoom):g}x"
+                dataset = FixedCropDataset(crop_rows, exp["input_size"], float(zoom))
+                crop_datasets[partition_name][label] = dataset
+                crop_loaders[partition_name][label] = DataLoader(
+                    dataset, batch_size=int(exp["batch_size"]), shuffle=False,
+                    persistent_workers=persistent_workers, **loader_options,
+                )
+        print(f"Crop validation active: zooms={crop_validation['zooms']} samples/partition={crop_count}", flush=True)
+        atomic_json(run_dir / "crop_eval_ids.json", crop_eval_ids)
     sample = datasets["train"][0]
     image, depth, normal, mask = sample[:4]
     if len(sample) == 5:
@@ -463,6 +486,10 @@ def main():
             train_seconds = prior_seconds + time.perf_counter() - epoch_start
             val_start = time.perf_counter()
             val_metrics = evaluate(model, loaders["val"], device, detail_metrics=bool(exp.get("detail_metrics", False)))
+            crop_val_metrics = {
+                label: evaluate(model, crop_loader, device, detail_metrics=True)
+                for label, crop_loader in crop_loaders["val"].items()
+            }
             torch.cuda.synchronize()
             val_seconds = time.perf_counter() - val_start
             preview_x, preview_d, preview_n, preview_m = next(iter(loaders["val"]))
@@ -474,7 +501,14 @@ def main():
             epoch_seconds = time.perf_counter() - epoch_start
             sample_rate = part_sizes["train"] / max(train_seconds, 1e-6)
             eta = max(int(exp["epochs"]) - epoch - 1, 0) * epoch_seconds
-            score = val_metrics["depth_rmse_m"] / 0.1 + val_metrics["normal_mean_deg"] / 30.0
+            full_score = val_metrics["depth_rmse_m"] / 0.1 + val_metrics["normal_mean_deg"] / 30.0
+            crop_normal_score = crop_silog_score = 0.0
+            if crop_val_metrics:
+                crop_normal = float(np.mean([value["normal_mean_deg"] for value in crop_val_metrics.values()]))
+                crop_silog = float(np.mean([value["depth_silog_x100"] for value in crop_val_metrics.values()]))
+                crop_normal_score = float(crop_validation.get("normal_score_weight", 0)) * crop_normal / 30.0
+                crop_silog_score = float(crop_validation.get("silog_score_weight", 0)) * crop_silog / 5.0
+            score = full_score + crop_normal_score + crop_silog_score
             if not math.isfinite(score):
                 raise FloatingPointError(f"Non-finite validation score at epoch {epoch + 1}: {score}")
             if scheduler_name == "cosine":
@@ -496,7 +530,7 @@ def main():
                     and stale_epochs >= int(early_stopping["patience"])
                 )
             peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
-            record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "selection_score": score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[-1]["lr"], "encoder_lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
+            record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "crop_val": crop_val_metrics, "selection_score": score, "full_score": full_score, "crop_normal_score": crop_normal_score, "crop_silog_score": crop_silog_score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[-1]["lr"], "encoder_lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
             if early_stopping:
                 record.update(early_stop_wait=stale_epochs,
                               early_stop_reference_score=early_stop_reference_score,
@@ -517,7 +551,11 @@ def main():
             resume_train_totals = []
             resume_task_totals = {}
             resume_train_seconds = 0.0
-            print(f"epoch {epoch + 1:03d}/{exp['epochs']} iterations={train_steps:,} train={record['train_loss']:.4f} val depth(RMSE m)={val_metrics['depth_rmse_m']:.4f} normal(mean°)={val_metrics['normal_mean_deg']:.2f} score={score:.4f} train={train_seconds / 60:.1f}m val={val_seconds / 60:.1f}m rate={sample_rate:.1f} samples/s ETA={eta / 60:.1f}m", flush=True)
+            crop_summary = "".join(
+                f" crop_{label}_normal={values['normal_mean_deg']:.2f}deg crop_{label}_SILog={values['depth_silog_x100']:.2f}"
+                for label, values in crop_val_metrics.items()
+            )
+            print(f"epoch {epoch + 1:03d}/{exp['epochs']} iterations={train_steps:,} train={record['train_loss']:.4f} val depth(RMSE m)={val_metrics['depth_rmse_m']:.4f} normal(mean°)={val_metrics['normal_mean_deg']:.2f}{crop_summary} score={score:.4f} train={train_seconds / 60:.1f}m val={val_seconds / 60:.1f}m rate={sample_rate:.1f} samples/s ETA={eta / 60:.1f}m", flush=True)
             if early_stopped:
                 print(f"Early stopping at epoch {epoch + 1}: validation score has not improved by {min_delta:.4f} for {stale_epochs} epochs; best checkpoint remains {checkpoint}.", flush=True)
                 break
@@ -527,13 +565,22 @@ def main():
         best_state = torch.load(checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(best_state["model"])
         test_metrics = evaluate(model, loaders["test"], device, detail_metrics=bool(exp.get("detail_metrics", False)))
-        atomic_json(run_dir / "test_metrics.json", test_metrics)
+        crop_test_metrics = {
+            label: evaluate(model, crop_loader, device, detail_metrics=True)
+            for label, crop_loader in crop_loaders["test"].items()
+        }
+        atomic_json(run_dir / "test_metrics.json", {**test_metrics, "crop": crop_test_metrics} if crop_test_metrics else test_metrics)
         remote_backup(run_dir / "test_metrics.json", output_cfg.get("backup_remote", ""))
         print("Held-out test metrics:", json.dumps(test_metrics, indent=2), flush=True)
+        if crop_test_metrics:
+            print("Held-out crop metrics:", json.dumps(crop_test_metrics, indent=2), flush=True)
         print(f"Training complete. Best epoch={best_state.get('best_epoch', best_state['epoch'])}; checkpoint={checkpoint}", flush=True)
     finally:
         for dataset in datasets.values():
             dataset.close()
+        for partition_datasets in crop_datasets.values():
+            for dataset in partition_datasets.values():
+                dataset.close()
 
 
 if __name__ == "__main__":

@@ -116,3 +116,19 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 nohup bash scripts/train_dgx
 ```
 
 The launcher prints the timestamped training log path; `tail -f logs/v7_from_v5_launcher.log` shows startup errors, and `./scripts/tail_train.sh` follows the training log. Compare V5, V6, and V7 on the same held-out samples and real photos, with identical preprocessing, masks, and depth color scales. The V7 validation history also records depth-edge, normal-boundary, and scale-invariant depth metrics.
+
+## V8 moderate-crop fine-tune and evaluation
+
+The five-sample held-out control showed that head-anchored crops at 1.5× changed V7 mean normal error from 26.81° on a lower-resolution full frame to 105.16° on the crop. V8 starts again from the same V5 checkpoint as V7 and keeps its architecture, losses, learning rates, 30-epoch cap, and early stopping. This isolates the change in crop training and checkpoint selection. Training samples moderate head-anchored zooms from 1.25×–2.25×; the original V7 crop ranges left the 1.5× region underrepresented. Crops smaller than 128 source pixels high are skipped. Full-frame samples retain metric-depth supervision; cropped samples retain shape and normal supervision.
+
+Each epoch also evaluates fixed 1.5× and 2× crops on 256 validation samples, selected once using the run seed. The selection score is the original full-frame validation score plus `0.5 × mean(crop normal error)/30` plus `0.15 × mean(crop SILog ×100)/5`. Early stopping and `best_checkpoint.pt` use this combined score. `history.json` stores the separate crop metrics; after training, `test_metrics.json` contains full-frame metrics and the same crop metrics on a separate fixed held-out subset. These crop results should be compared with the full-frame results; improvement on synthetic crops still needs a real-photo visual check.
+
+```bash
+cd ~/raid/Clara/relight-train-model
+git pull --ff-only origin main
+mkdir -p logs
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 nohup bash scripts/train_dgx.sh \
+  configs/dgx_fastvit_t8_depth_normals_local50000_seed42_v8_moderate_crop_30ep.yaml \
+  > logs/v8_moderate_crop_launcher.log 2>&1 < /dev/null &
+tail -f logs/v8_moderate_crop_launcher.log
+```

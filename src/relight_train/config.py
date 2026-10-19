@@ -71,6 +71,30 @@ def load_config(path: str | Path) -> dict[str, Any]:
             raise ValueError("domain_augmentation.jpeg_quality must be [minimum, maximum] within 1-100")
         if int(domain_augmentation.get("minimum_person_height", 64)) < 1:
             raise ValueError("domain_augmentation.minimum_person_height must be positive")
+        bands = domain_augmentation.get("crop_zoom_bands")
+        if bands is not None:
+            if not isinstance(bands, list) or not bands:
+                raise ValueError("domain_augmentation.crop_zoom_bands must be a nonempty list")
+            for band in bands:
+                if not isinstance(band, (list, tuple)) or len(band) != 3:
+                    raise ValueError("Each crop_zoom_band must be [minimum_zoom, maximum_zoom, weight]")
+                low, high, weight = map(float, band)
+                if not 1 < low <= high or weight <= 0:
+                    raise ValueError("Crop zoom bands require 1 < minimum <= maximum and positive weight")
+            if not 24 <= int(domain_augmentation.get("minimum_crop_height", 96)) <= input_size[0]:
+                raise ValueError("minimum_crop_height must be between 24 and input height")
+    crop_validation = exp.get("crop_validation")
+    if crop_validation is not None:
+        if not isinstance(crop_validation, dict):
+            raise ValueError("crop_validation must be a mapping")
+        zooms = crop_validation.get("zooms", [])
+        if not isinstance(zooms, list) or not zooms or any(float(zoom) <= 1 for zoom in zooms):
+            raise ValueError("crop_validation.zooms must contain zoom values greater than 1")
+        if int(crop_validation.get("samples", 0)) < 1:
+            raise ValueError("crop_validation.samples must be positive")
+        for key in ("normal_score_weight", "silog_score_weight"):
+            if float(crop_validation.get(key, 0)) < 0:
+                raise ValueError(f"crop_validation.{key} must be nonnegative")
     data["source_root"] = _expand_path(data["source_root"])
     data["inventory_dir"] = _expand_path(data["inventory_dir"])
     output["run_dir"] = _expand_path(output["run_dir"])
