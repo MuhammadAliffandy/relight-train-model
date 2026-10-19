@@ -1,9 +1,11 @@
 # One Colab cell: inspect the complete guarded FastViT-T8/FPN72 forward path.
 # Set RUN_NAME to V8 after its checkpoint has been copied to Drive.
-RUN_NAME = "fastvit_t8_fpn72_v7_from_v5_geometry_50k_seed42_384x512_30ep"
-CHECKPOINT_NAME = "best_checkpoint.pt"
-ENCODER_LEAF_DETAIL = True
-CHANNEL_PREVIEWS = 3
+RUN_NAME = globals().get(
+    "RUN_NAME", "fastvit_t8_fpn72_v7_from_v5_geometry_50k_seed42_384x512_30ep"
+)
+CHECKPOINT_NAME = globals().get("CHECKPOINT_NAME", "best_checkpoint.pt")
+ENCODER_LEAF_DETAIL = globals().get("ENCODER_LEAF_DETAIL", True)
+CHANNEL_PREVIEWS = globals().get("CHANNEL_PREVIEWS", 3)
 
 import importlib.util
 import math
