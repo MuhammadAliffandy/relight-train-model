@@ -237,3 +237,74 @@ class RawSynthHumanDataset(Dataset):
         tensors[2] = F.normalize(tensors[2], dim=0, eps=1e-6)
         tensors[3] *= (torch.linalg.vector_norm(tensors[2], dim=0, keepdim=True) > 0).float()
         return tuple(tensors)
+
+
+class RealPseudoDepthDataset(Dataset):
+    """Unlabeled real RGB images paired with frozen-teacher relative-depth maps."""
+
+    def __init__(self, manifest_path: Path, pseudo_depth_root: Path, input_size):
+        self.manifest_path = Path(manifest_path)
+        self.pseudo_depth_root = Path(pseudo_depth_root)
+        self.input_size = tuple(int(value) for value in input_size)
+        self.rows = [
+            json.loads(line)
+            for line in self.manifest_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if not self.rows:
+            raise ValueError(f"Real-image pseudo-depth manifest is empty: {self.manifest_path}")
+        missing = []
+        for row in self.rows:
+            if "image_id" not in row or "image" not in row:
+                raise ValueError(f"Malformed row in V9 real-data manifest: {row}")
+            for path in (Path(row["image"]), self.pseudo_depth_root / f"{row['image_id']}.npy"):
+                if not path.is_file():
+                    missing.append(path)
+                    if len(missing) == 5:
+                        break
+            if len(missing) == 5:
+                break
+        if missing:
+            raise FileNotFoundError(
+                "V9 real-data files are incomplete; first missing paths: "
+                + ", ".join(str(path) for path in missing)
+            )
+
+    def __len__(self):
+        return len(self.rows)
+
+    def close(self):
+        return None
+
+    def __getitem__(self, index):
+        row = self.rows[index]
+        image_path = Path(row["image"])
+        depth_path = self.pseudo_depth_root / f"{row['image_id']}.npy"
+        if not image_path.is_file() or not depth_path.is_file():
+            raise FileNotFoundError(f"Missing V9 real sample or teacher map: {image_path} | {depth_path}")
+        image = _read_rgb(image_path, self.input_size)
+        with depth_path.open("rb") as handle:
+            pseudo_depth = np.load(handle, allow_pickle=False).astype(np.float32)
+        if pseudo_depth.ndim != 2:
+            raise ValueError(f"Expected a 2D pseudo-depth map in {depth_path}; got {pseudo_depth.shape}")
+        valid = np.isfinite(pseudo_depth)
+        if int(valid.sum()) < max(64, int(0.05 * valid.size)):
+            raise ValueError(f"Too few valid pseudo-depth pixels in {depth_path}")
+        valid = _resize_array(valid.astype(np.uint8), self.input_size, True)[..., 0] > 0
+        fill_value = float(np.nanmedian(pseudo_depth))
+        pseudo_depth = np.nan_to_num(
+            pseudo_depth, nan=fill_value, posinf=fill_value, neginf=fill_value
+        )
+        pseudo_depth = np.asarray(
+            Image.fromarray(pseudo_depth).resize(
+                (self.input_size[1], self.input_size[0]), Image.Resampling.BILINEAR
+            ),
+            dtype=np.float32,
+        )
+        pseudo_depth = np.where(valid, pseudo_depth, 0.0)
+        image = (image - np.array([0.485, 0.456, 0.406], np.float32)) / np.array([0.229, 0.224, 0.225], np.float32)
+        return (
+            torch.from_numpy(image.copy()).permute(2, 0, 1).float(),
+            torch.from_numpy(pseudo_depth[None].copy()).float(),
+            torch.from_numpy(valid[None].astype(np.float32)),
+        )

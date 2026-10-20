@@ -5,6 +5,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def pseudo_depth_distillation_loss(predicted_depth, teacher_depth, valid_mask):
+    """Match per-image relative depth shape without assuming teacher metric scale."""
+    predicted_values = predicted_depth.float()
+    teacher = teacher_depth.float()
+    losses = []
+    for index in range(predicted_depth.shape[0]):
+        valid = valid_mask[index, 0].bool() & torch.isfinite(teacher[index, 0])
+        if int(valid.sum()) < 64:
+            continue
+        pred_values = predicted_values[index, 0][valid]
+        teacher_values = teacher[index, 0][valid]
+        pred_low, pred_high = torch.quantile(pred_values, pred_values.new_tensor([0.05, 0.95]))
+        teacher_low, teacher_high = torch.quantile(teacher_values, teacher_values.new_tensor([0.05, 0.95]))
+        pred_span = (pred_high - pred_low).clamp_min(1e-4)
+        teacher_span = (teacher_high - teacher_low).clamp_min(1e-4)
+        pred_norm = ((predicted_values[index, 0] - pred_low) / pred_span).clamp(-0.25, 1.25)
+        teacher_norm = ((teacher[index, 0] - teacher_low) / teacher_span).clamp(-0.25, 1.25)
+        losses.append(F.smooth_l1_loss(pred_norm[valid], teacher_norm[valid], beta=0.1))
+    if not losses:
+        raise ValueError("A real-image batch has no usable teacher depth pixels")
+    return torch.stack(losses).mean()
+
+
 class GeometryObjective(nn.Module):
     def __init__(self, depth_mode="metric", auxiliary_weight=0.0, crop_depth_shape_weight=0.0,
                  depth_gradient_weight=0.0, normal_edge_weight=0.0):

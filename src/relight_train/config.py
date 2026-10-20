@@ -100,4 +100,16 @@ def load_config(path: str | Path) -> dict[str, Any]:
     output["run_dir"] = _expand_path(output["run_dir"])
     if exp.get("init_checkpoint"):
         exp["init_checkpoint"] = _expand_path(exp["init_checkpoint"])
+    real_data = config.get("real_data")
+    if real_data is not None:
+        if not isinstance(real_data, dict):
+            raise ValueError("real_data must be a mapping")
+        for key in ("manifest", "pseudo_depth_root"):
+            real_data[key] = _expand_path(real_data[key])
+        if int(real_data.get("batch_size", 0)) < 1:
+            raise ValueError("real_data.batch_size must be positive")
+        if int(real_data.get("batches_per_synth_batch", 0)) < 1:
+            raise ValueError("real_data.batches_per_synth_batch must be positive")
+        if float(real_data.get("distillation_weight", -1)) < 0:
+            raise ValueError("real_data.distillation_weight must be nonnegative")
     return config

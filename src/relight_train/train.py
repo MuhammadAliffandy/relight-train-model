@@ -20,10 +20,10 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from relight_train.config import load_config
-from relight_train.data import RawSynthHumanDataset, build_raw_manifest
+from relight_train.data import RawSynthHumanDataset, RealPseudoDepthDataset, build_raw_manifest
 from relight_train.domain_augmentation import DomainAugmentedDataset, FixedCropDataset
 from relight_train.model import PortraitGeometryModel
-from relight_train.objectives import GeometryObjective, evaluate
+from relight_train.objectives import GeometryObjective, evaluate, pseudo_depth_distillation_loss
 
 
 def atomic_json(path: Path, value):
@@ -114,7 +114,14 @@ def main():
         raise RuntimeError("CUDA is unavailable. Activate the DGX Conda environment and check PyTorch CUDA support.")
 
     rows, partitions, inventory = build_raw_manifest(data_cfg["rclone_source"], data_cfg["source_root"], run_dir, int(data_cfg["expected_samples"]), seed, data_cfg["inventory_dir"])
-    selection_sha256 = hashlib.sha256("\n".join(sorted(row["subject_id"] for row in rows)).encode("utf-8")).hexdigest()
+    selection_material = "\n".join(sorted(row["subject_id"] for row in rows))
+    real_cfg = config.get("real_data")
+    if real_cfg:
+        real_manifest = Path(real_cfg["manifest"])
+        if not real_manifest.is_file():
+            raise FileNotFoundError(f"V9 real-data manifest not found: {real_manifest}")
+        selection_material += "\nreal_manifest_sha256=" + hashlib.sha256(real_manifest.read_bytes()).hexdigest()
+    selection_sha256 = hashlib.sha256(selection_material.encode("utf-8")).hexdigest()
     part_sizes = {key: len(value) for key, value in partitions.items()}
     print(f"Raw dataset manifest ready: {sum(part_sizes.values()):,} samples; split={part_sizes}; inventory={inventory}", flush=True)
     domain_augmentation = exp.get("domain_augmentation")
@@ -132,6 +139,28 @@ def main():
         loader_options["prefetch_factor"] = int(exp.get("prefetch_factor", 2))
     persistent_workers = workers > 0 and str(exp.get("decoder_refinement", "none")) != "fullres"
     loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, persistent_workers=persistent_workers, **loader_options) for key, value in datasets.items()}
+    real_dataset = None
+    real_loader = None
+    if real_cfg:
+        real_dataset = RealPseudoDepthDataset(
+            real_cfg["manifest"], real_cfg["pseudo_depth_root"], exp["input_size"]
+        )
+        real_loader = DataLoader(
+            real_dataset,
+            batch_size=int(real_cfg["batch_size"]),
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=persistent_workers,
+            **({"prefetch_factor": int(exp.get("prefetch_factor", 2))} if workers > 0 else {}),
+        )
+        print(
+            "Real-image depth distillation active: "
+            f"images={len(real_dataset):,} batches/step={int(real_cfg['batches_per_synth_batch'])} "
+            f"weight={float(real_cfg['distillation_weight']):.4f}; normals remain SynthHuman-supervised.",
+            flush=True,
+        )
     crop_validation = exp.get("crop_validation")
     crop_datasets = {"val": {}, "test": {}}
     crop_loaders = {"val": {}, "test": {}}
@@ -405,12 +434,24 @@ def main():
             else:
                 train_totals = []
                 task_totals = {"depth_loss": [], "normal_loss": []}
+                if real_cfg:
+                    task_totals["distillation_depth_loss"] = []
                 if auxiliary_weight:
                     task_totals.update({"coarse_depth_loss": [], "coarse_normal_loss": []})
                 epoch_order = [(index, (seed + epoch * 1_000_003 + index) % (2**32)) for index in range(len(datasets["train"]))]
                 random.Random(seed + epoch).shuffle(epoch_order)
                 resume_batch = 0
             loader = DataLoader(datasets["train"], batch_size=int(exp["batch_size"]), sampler=epoch_order[resume_batch * int(exp["batch_size"]):], persistent_workers=persistent_workers, **loader_options)
+            real_iterator = iter(real_loader) if real_loader is not None else None
+            real_batches_per_step = int(real_cfg["batches_per_synth_batch"]) if real_cfg else 0
+            if real_iterator is not None:
+                real_offset = (resume_batch * real_batches_per_step) % len(real_loader)
+                for _ in range(real_offset):
+                    try:
+                        next(real_iterator)
+                    except StopIteration:
+                        real_iterator = iter(real_loader)
+                        next(real_iterator)
             prior_seconds = resume_train_seconds if epoch == start_epoch else 0.0
             last_checkpoint_time = time.monotonic()
             last_batch_end = time.perf_counter()
@@ -434,6 +475,24 @@ def main():
                         predicted_depth, d, predicted_normal, n, m, coarse_depth, coarse_normal,
                         depth_mask=depth_mask,
                     )
+                    if real_iterator is not None:
+                        pseudo_losses = []
+                        for _ in range(real_batches_per_step):
+                            try:
+                                real_x, teacher_depth, teacher_valid = next(real_iterator)
+                            except StopIteration:
+                                real_iterator = iter(real_loader)
+                                real_x, teacher_depth, teacher_valid = next(real_iterator)
+                            real_x = real_x.to(device, non_blocking=True)
+                            teacher_depth = teacher_depth.to(device, non_blocking=True)
+                            teacher_valid = teacher_valid.to(device, non_blocking=True)
+                            real_predicted_depth, _ = model(real_x)
+                            pseudo_losses.append(
+                                pseudo_depth_distillation_loss(real_predicted_depth, teacher_depth, teacher_valid)
+                            )
+                        distillation_loss = torch.stack(pseudo_losses).mean()
+                        loss = loss + float(real_cfg["distillation_weight"]) * distillation_loss
+                        parts["distillation_depth_loss"] = distillation_loss.detach()
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite loss at epoch={epoch + 1}, batch={batch_index + 1}")
                 scaler.scale(loss).backward()
@@ -448,6 +507,8 @@ def main():
                 memory = torch.cuda.memory_allocated(device) / 2**30
                 peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
                 postfix = {"iteration": f"{completed}/{train_steps}", "loss": f"{float(loss.detach()):.4f}", "depth": f"{float(parts['depth_loss']):.4f}", "normal": f"{float(parts['normal_loss']):.4f}", "gpu_mem": f"{memory:.1f}GiB", "data_s": f"{current_wait:.2f}"}
+                if "distillation_depth_loss" in parts:
+                    postfix["distill_depth"] = f"{float(parts['distillation_depth_loss']):.4f}"
                 if auxiliary_weight:
                     postfix.update(coarse_depth=f"{float(parts['coarse_depth_loss']):.4f}", coarse_normal=f"{float(parts['coarse_normal_loss']):.4f}")
                 extra_loss_names = (
@@ -462,11 +523,12 @@ def main():
                     atomic_json(progress_path, {"epoch": epoch + 1, "epochs_total": exp["epochs"], "batches_complete": completed, "batches_total": train_steps, "latest_train_loss": train_totals[-1], "last_update_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
                 if completed % int(exp["log_interval_steps"]) == 0:
                     coarse_log = (f" coarse_depth={float(parts['coarse_depth_loss']):.4f} coarse_normal={float(parts['coarse_normal_loss']):.4f}" if auxiliary_weight else "")
+                    distillation_log = (f" distill_depth={float(parts['distillation_depth_loss']):.4f}" if "distillation_depth_loss" in parts else "")
                     extra_log = "".join(
                         f" {name.removesuffix('_loss')}={float(parts[name]):.4f}"
                         for name in extra_loss_names if name in parts
                     )
-                    print(f"epoch {epoch + 1:03d}/{exp['epochs']} batch {completed}/{train_steps} loss={train_totals[-1]:.4f} depth={float(parts['depth_loss']):.4f} normal={float(parts['normal_loss']):.4f}{coarse_log}{extra_log} data_wait={current_wait:.2f}s gpu_mem={memory:.2f}GiB gpu_peak={peak_memory:.2f}GiB memory={process_memory_gib()}", flush=True)
+                    print(f"epoch {epoch + 1:03d}/{exp['epochs']} batch {completed}/{train_steps} loss={train_totals[-1]:.4f} depth={float(parts['depth_loss']):.4f} normal={float(parts['normal_loss']):.4f}{coarse_log}{distillation_log}{extra_log} data_wait={current_wait:.2f}s gpu_mem={memory:.2f}GiB gpu_peak={peak_memory:.2f}GiB memory={process_memory_gib()}", flush=True)
                 if stop_requested:
                     stage["name"] = f"epoch {epoch + 1} batch {completed} checkpoint"
                     save_checkpoint(last_checkpoint, state_payload(epoch, completed, epoch_order, train_totals, task_totals, prior_seconds + time.perf_counter() - epoch_start))
@@ -578,6 +640,8 @@ def main():
     finally:
         for dataset in datasets.values():
             dataset.close()
+        if real_dataset is not None:
+            real_dataset.close()
         for partition_datasets in crop_datasets.values():
             for dataset in partition_datasets.values():
                 dataset.close()

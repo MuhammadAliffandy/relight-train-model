@@ -1,0 +1,73 @@
+experiment:
+  name: fastvit_t8_fpn72_v9_da2_distill_openimages1k_synth5k_seed42_384x512_pilot
+  seed: 42
+  epochs: 12
+  early_stopping:
+    min_epochs: 4
+    patience: 3
+    min_delta: 0.003
+  batch_size: 8
+  workers: 2
+  prefetch_factor: 1
+  input_size: [384, 512]
+  backbone: fastvit_t8.apple_in1k
+  pretrained: false
+  fpn_width: 72
+  fpn_fusion: concat
+  depth_mode: metric
+  decoder_refinement: fullres
+  refinement_width: 48
+  fullres_width: 24
+  rgb_full_width: 8
+  auxiliary_loss_weight: 0.5
+  guarded_refinement: true
+  residual_depth_limit: 0.05
+  residual_normal_limit: 0.15
+  grayscale_refinement: true
+  init_checkpoint: ./runs/fastvit_t8_fpn72_v8_moderate_crop_50k_seed42_384x512_30ep/best_checkpoint.pt
+  init_mode: full
+  crop_depth_shape_weight: 0.3
+  depth_gradient_weight: 0.2
+  normal_edge_weight: 0.2
+  learning_rate: 0.000005
+  encoder_learning_rate: 0.000001
+  min_learning_rate: 0.0000001
+  scheduler: cosine
+  weight_decay: 0.0001
+  checkpoint_interval_minutes: 10
+  log_interval_steps: 10
+  progress_json_interval_steps: 10
+  amp: true
+  detail_metrics: true
+  domain_augmentation:
+    background_probability: 0.35
+    jpeg_probability: 0.30
+    jpeg_quality: [75, 95]
+    crop_probability: 0.35
+    minimum_person_height: 64
+    minimum_crop_height: 128
+    crop_zoom_bands:
+      - [1.25, 1.75, 0.65]
+      - [1.75, 2.25, 0.35]
+  crop_validation:
+    zooms: [1.5, 2.0]
+    samples: 128
+    normal_score_weight: 0.5
+    silog_score_weight: 0.15
+
+data:
+  rclone_source: xxdrive:AppleCapstoneRelighting/dataset/sources/SynthHuman
+  source_root: ./data/synthhuman_local30000/raw
+  expected_samples: 5000
+  inventory_dir: ./data/synthhuman_local30000/index
+
+real_data:
+  manifest: ./data/v9_openimages_people/manifest.jsonl
+  pseudo_depth_root: ./data/v9_openimages_people/pseudo_depth
+  batch_size: 2
+  batches_per_synth_batch: 1
+  distillation_weight: 0.15
+
+output:
+  run_dir: ./runs/fastvit_t8_fpn72_v9_da2_distill_openimages1k_synth5k_seed42_384x512_pilot
+  backup_remote: ""

@@ -132,3 +132,30 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 nohup bash scripts/train_dgx
   > logs/v8_moderate_crop_launcher.log 2>&1 < /dev/null &
 tail -f logs/v8_moderate_crop_launcher.log
 ```
+
+## V9: real-image depth distillation pilot
+
+V9 initializes the student from the completed V8 checkpoint and uses a frozen Depth Anything V2 Base model as the teacher. `scripts/prepare_v9_dgx.sh` installs the optional data/teacher dependencies, downloads up to 1,000 Open Images V7 training images containing people, and writes one teacher depth map per image. The manifest preserves FiftyOne sample metadata for provenance; it does not guarantee per-image license information, so verify image rights at the source before redistribution or commercial use. The downloaded images do not have depth ground truth.
+
+Training interleaves SynthHuman batches (metric depth plus GT normals) with real-image batches (relative teacher-depth shape loss only). The teacher loss is normalized within each image and does not claim metric depth. Real images have no normal supervision; normals continue to be learned from SynthHuman. The pilot starts from V8 at low learning rates, uses 5,000 SynthHuman samples, and early-stops against the existing SynthHuman validation/crop score. That score protects the known geometry behavior but does not measure real-photo accuracy; inspect real images separately and keep any visual evaluation photos out of the distillation pool.
+
+On DGX, first confirm that the V8 checkpoint path in the config exists, then prepare the input data:
+
+```bash
+cd ~/raid/Clara/relight-train-model
+git pull --ff-only origin main
+chmod +x scripts/prepare_v9_dgx.sh
+V9_REAL_SAMPLES=1000 ./scripts/prepare_v9_dgx.sh
+```
+
+The script can resume pseudo-depth generation: it reuses the downloaded image manifest and skips teacher maps already written. After checking `data/v9_openimages_people/manifest.jsonl`, start the separate pilot run:
+
+```bash
+mkdir -p logs
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 nohup ./scripts/train_dgx.sh \
+  configs/dgx_fastvit_t8_depth_normals_local5000_seed42_v9_da2_distill_pilot.yaml \
+  > logs/v9_da2_distill_launcher.log 2>&1 < /dev/null &
+tail -f logs/v9_da2_distill_launcher.log
+```
+
+The V9 run writes its own `runs/fastvit_t8_fpn72_v9_da2_distill_openimages1k_synth5k_seed42_384x512_pilot/` directory and never overwrites V8. Logs include `distill_depth`; `history.json` also records its average per epoch. The trainer's current early-stopping and checkpoint selection use SynthHuman validation and crop metrics, not a pseudo-label metric.
