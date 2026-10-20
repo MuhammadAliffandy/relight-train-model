@@ -298,7 +298,8 @@ def main():
             except OSError as error:
                 raise RuntimeError(
                     f"Cannot read xxdrive mount at {source}: {error}. "
-                    "Use --rclone-remote xxdrive:AppleCapstoneRelighting/datasets/face_depth_3d"
+                    "Check the mount with findmnt and ls before retrying. "
+                    "The --rclone-remote option requires an installed rclone CLI."
                 ) from error
             if not available:
                 raise FileNotFoundError(f"xxdrive dataset directory not found: {source}")
