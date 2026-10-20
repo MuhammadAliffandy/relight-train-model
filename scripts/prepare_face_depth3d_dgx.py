@@ -100,15 +100,15 @@ def copy_parquet(source, destination, expected_files):
     log(f"Copy complete: {len(source_files)} Parquet files in {destination}")
 
 
-def copy_rclone(remote, destination, expected_files):
+def copy_rclone(remote, destination, expected_files, rclone_binary):
     destination.mkdir(parents=True, exist_ok=True)
     try:
         listing = subprocess.run(
-            ["rclone", "lsf", remote, "--recursive", "--files-only"],
+            [rclone_binary, "lsf", remote, "--recursive", "--files-only"],
             check=True, capture_output=True, text=True,
         )
     except FileNotFoundError as error:
-        raise RuntimeError("rclone is not installed or is not in PATH on DGX") from error
+        raise RuntimeError(f"rclone binary not found: {rclone_binary}") from error
     except subprocess.CalledProcessError as error:
         raise RuntimeError(f"Cannot list {remote}: {error.stderr.strip()}") from error
     names = [line for line in listing.stdout.splitlines() if line.endswith(".parquet")]
@@ -117,7 +117,7 @@ def copy_rclone(remote, destination, expected_files):
     log(f"Remote has {len(names)} Parquet files. Copying directly with rclone, bypassing the xxdrive mount")
     subprocess.run(
         [
-            "rclone", "copy", remote, str(destination),
+            rclone_binary, "copy", remote, str(destination),
             "--stats", "10s", "--stats-one-line", "--stats-log-level", "NOTICE",
             "--transfers", "2", "--checkers", "4", "--retries", "10",
             "--low-level-retries", "20",
@@ -279,6 +279,10 @@ def main():
         "--rclone-remote", default=None,
         help="Read directly from this rclone remote instead of the xxdrive FUSE mount",
     )
+    parser.add_argument(
+        "--rclone-binary", default="rclone",
+        help="Path to rclone; on DGX it may be inside the brain_env Conda environment",
+    )
     parser.add_argument("--copy-only", action="store_true")
     parser.add_argument("--extract-only", action="store_true")
     parser.add_argument("--expected-files", type=int, default=EXPECTED_FILES)
@@ -291,7 +295,7 @@ def main():
     parquet_root = output / "parquet"
     if not args.extract_only:
         if args.rclone_remote:
-            copy_rclone(args.rclone_remote, parquet_root, args.expected_files)
+            copy_rclone(args.rclone_remote, parquet_root, args.expected_files, args.rclone_binary)
         else:
             try:
                 available = source.is_dir()
