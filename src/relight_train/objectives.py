@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 def pseudo_depth_distillation_loss(predicted_depth, teacher_depth, valid_mask):
-    """Match per-image relative depth shape without assuming teacher metric scale."""
+    """Match DA2 relative inverse-depth shape to metric depth without scale assumptions."""
     predicted_values = predicted_depth.float()
     teacher = teacher_depth.float()
     losses = []
@@ -20,7 +20,10 @@ def pseudo_depth_distillation_loss(predicted_depth, teacher_depth, valid_mask):
         teacher_low, teacher_high = torch.quantile(teacher_values, teacher_values.new_tensor([0.05, 0.95]))
         pred_span = (pred_high - pred_low).clamp_min(1e-4)
         teacher_span = (teacher_high - teacher_low).clamp_min(1e-4)
-        pred_norm = ((predicted_values[index, 0] - pred_low) / pred_span).clamp(-0.25, 1.25)
+        # DA2's released relative map has larger values for nearer surfaces,
+        # while metric depth has smaller values for nearer surfaces. Reverse
+        # the student's normalized metric-depth order before matching.
+        pred_norm = ((pred_high - predicted_values[index, 0]) / pred_span).clamp(-0.25, 1.25)
         teacher_norm = ((teacher[index, 0] - teacher_low) / teacher_span).clamp(-0.25, 1.25)
         losses.append(F.smooth_l1_loss(pred_norm[valid], teacher_norm[valid], beta=0.1))
     if not losses:

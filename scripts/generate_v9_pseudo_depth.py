@@ -79,7 +79,7 @@ def main():
 
     metadata = {
         "teacher": args.teacher,
-        "depth_type": "relative teacher prediction; not metric ground truth",
+        "depth_type": "relative inverse-depth-style teacher prediction; larger values indicate nearer surfaces; not metric ground truth",
         "source_manifest": str(args.manifest.resolve()),
         "processed_rows": len(rows),
         "output_dir": str(args.output.resolve()),
