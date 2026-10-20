@@ -137,7 +137,7 @@ def main():
     selection_material = "\n".join(sorted(row["subject_id"] for row in rows))
     real_cfg = config.get("real_data")
     if real_cfg:
-        for manifest_key in ("manifest", "validation_manifest"):
+        for manifest_key in ("manifest", "validation_manifest", "test_manifest"):
             if not real_cfg.get(manifest_key):
                 continue
             real_manifest = Path(real_cfg[manifest_key])
@@ -166,6 +166,8 @@ def main():
     real_loader = None
     real_validation_dataset = None
     real_validation_loader = None
+    real_test_dataset = None
+    real_test_loader = None
     if real_cfg:
         real_dataset = RealPseudoDepthDataset(
             real_cfg["manifest"], real_cfg["pseudo_depth_root"], exp["input_size"],
@@ -196,12 +198,27 @@ def main():
                 persistent_workers=persistent_workers,
                 **({"prefetch_factor": int(exp.get("prefetch_factor", 2))} if workers > 0 else {}),
             )
+        if real_cfg.get("test_manifest"):
+            real_test_dataset = RealPseudoDepthDataset(
+                real_cfg["test_manifest"], real_cfg["pseudo_depth_root"], exp["input_size"]
+            )
+            real_test_loader = DataLoader(
+                real_test_dataset,
+                batch_size=int(real_cfg["batch_size"]),
+                shuffle=False,
+                num_workers=workers,
+                pin_memory=True,
+                drop_last=False,
+                persistent_workers=persistent_workers,
+                **({"prefetch_factor": int(exp.get("prefetch_factor", 2))} if workers > 0 else {}),
+            )
         print(
             "Real-image depth distillation active: "
             f"images={len(real_dataset):,} batches/step={int(real_cfg['batches_per_synth_batch'])} "
             f"weight={float(real_cfg['distillation_weight']):.4f} "
             f"crop_p={float(real_cfg.get('crop_probability', 0.0)):.2f}; "
-            f"real_val={len(real_validation_dataset) if real_validation_dataset else 0}; "
+            f"real_val={len(real_validation_dataset) if real_validation_dataset else 0} "
+            f"real_test={len(real_test_dataset) if real_test_dataset else 0}; "
             "normals remain SynthHuman-supervised.",
             flush=True,
         )
@@ -455,6 +472,27 @@ def main():
         if not early_stopped:
             print(f"Resuming at epoch {start_epoch + 1}, after {resume_batch} completed batches.", flush=True)
 
+    # Keep the V9 initialization as the fallback if fine-tuning never beats its
+    # real-photo teacher agreement. The validation split chooses checkpoints;
+    # SynthHuman remains a labeled regression monitor.
+    if (
+        not last_checkpoint.is_file()
+        and real_validation_loader is not None
+        and init_checkpoint
+        and Path(init_checkpoint).is_file()
+    ):
+        best_score = evaluate_pseudo_depth(model, real_validation_loader, device)
+        early_stop_reference_score = best_score
+        baseline_state = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
+        baseline_state["best_epoch"] = 0
+        baseline_state["experiment"] = exp
+        save_checkpoint(checkpoint, baseline_state)
+        print(
+            f"Real-photo validation baseline={best_score:.6f}; "
+            "V9 initialization remains best unless V9.1 improves it.",
+            flush=True,
+        )
+
     train_steps = math.ceil(part_sizes["train"] / int(exp["batch_size"]))
     total_steps = train_steps * int(exp["epochs"])
     print(f"Run plan: epochs={exp['epochs']} batch={exp['batch_size']} steps/epoch={train_steps:,} max_steps={total_steps:,} output={run_dir}", flush=True)
@@ -615,20 +653,21 @@ def main():
                 crop_silog = float(np.mean([value["depth_silog_x100"] for value in crop_val_metrics.values()]))
                 crop_normal_score = float(crop_validation.get("normal_score_weight", 0)) * crop_normal / 30.0
                 crop_silog_score = float(crop_validation.get("silog_score_weight", 0)) * crop_silog / 5.0
-            score = full_score + crop_normal_score + crop_silog_score
-            if not math.isfinite(score):
-                raise FloatingPointError(f"Non-finite validation score at epoch {epoch + 1}: {score}")
+            synth_score = full_score + crop_normal_score + crop_silog_score
+            selection_score = real_val_distill_depth if real_val_distill_depth is not None else synth_score
+            if not math.isfinite(selection_score):
+                raise FloatingPointError(f"Non-finite checkpoint selection score at epoch {epoch + 1}: {selection_score}")
             if scheduler_name == "cosine":
                 scheduler.step()
             else:
-                scheduler.step(score)
-            improved = score < best_score
+                scheduler.step(selection_score)
+            improved = selection_score < best_score
             if improved:
-                best_score = score
+                best_score = selection_score
             if early_stopping:
                 min_delta = float(early_stopping.get("min_delta", 0.0))
-                if score < early_stop_reference_score - min_delta:
-                    early_stop_reference_score = score
+                if selection_score < early_stop_reference_score - min_delta:
+                    early_stop_reference_score = selection_score
                     stale_epochs = 0
                 elif epoch + 1 > int(early_stopping.get("min_epochs", 1)):
                     stale_epochs += 1
@@ -637,7 +676,7 @@ def main():
                     and stale_epochs >= int(early_stopping["patience"])
                 )
             peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
-            record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "crop_val": crop_val_metrics, "real_val_distill_depth": real_val_distill_depth, "selection_score": score, "full_score": full_score, "crop_normal_score": crop_normal_score, "crop_silog_score": crop_silog_score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[-1]["lr"], "encoder_lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
+            record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "crop_val": crop_val_metrics, "real_val_distill_depth": real_val_distill_depth, "selection_score": selection_score, "synth_selection_score": synth_score, "full_score": full_score, "crop_normal_score": crop_normal_score, "crop_silog_score": crop_silog_score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[-1]["lr"], "encoder_lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
             if early_stopping:
                 record.update(early_stop_wait=stale_epochs,
                               early_stop_reference_score=early_stop_reference_score,
@@ -666,7 +705,7 @@ def main():
                 f" real_pseudo_depth={real_val_distill_depth:.4f}"
                 if real_val_distill_depth is not None else ""
             )
-            print(f"epoch {epoch + 1:03d}/{exp['epochs']} iterations={train_steps:,} train={record['train_loss']:.4f} val depth(RMSE m)={val_metrics['depth_rmse_m']:.4f} normal(mean°)={val_metrics['normal_mean_deg']:.2f}{crop_summary}{real_val_summary} score={score:.4f} train={train_seconds / 60:.1f}m val={val_seconds / 60:.1f}m rate={sample_rate:.1f} samples/s ETA={eta / 60:.1f}m", flush=True)
+            print(f"epoch {epoch + 1:03d}/{exp['epochs']} iterations={train_steps:,} train={record['train_loss']:.4f} synth_val_depth(RMSE m)={val_metrics['depth_rmse_m']:.4f} synth_val_normal(mean°)={val_metrics['normal_mean_deg']:.2f}{crop_summary}{real_val_summary} synth_score={synth_score:.4f} selection_score={selection_score:.6f} train={train_seconds / 60:.1f}m val={val_seconds / 60:.1f}m rate={sample_rate:.1f} samples/s ETA={eta / 60:.1f}m", flush=True)
             if early_stopped:
                 print(f"Early stopping at epoch {epoch + 1}: validation score has not improved by {min_delta:.4f} for {stale_epochs} epochs; best checkpoint remains {checkpoint}.", flush=True)
                 break
@@ -680,11 +719,19 @@ def main():
             label: evaluate(model, crop_loader, device, detail_metrics=True)
             for label, crop_loader in crop_loaders["test"].items()
         }
-        atomic_json(run_dir / "test_metrics.json", {**test_metrics, "crop": crop_test_metrics} if crop_test_metrics else test_metrics)
+        real_test_distill_depth = evaluate_pseudo_depth(model, real_test_loader, device)
+        test_payload = {"synthhuman": test_metrics}
+        if crop_test_metrics:
+            test_payload["synthhuman_crop"] = crop_test_metrics
+        if real_test_distill_depth is not None:
+            test_payload["real_pseudo_depth_teacher_agreement"] = real_test_distill_depth
+        atomic_json(run_dir / "test_metrics.json", test_payload)
         remote_backup(run_dir / "test_metrics.json", output_cfg.get("backup_remote", ""))
         print("Held-out test metrics:", json.dumps(test_metrics, indent=2), flush=True)
         if crop_test_metrics:
             print("Held-out crop metrics:", json.dumps(crop_test_metrics, indent=2), flush=True)
+        if real_test_distill_depth is not None:
+            print(f"Held-out real pseudo-depth teacher agreement: {real_test_distill_depth:.6f}", flush=True)
         print(f"Training complete. Best epoch={best_state.get('best_epoch', best_state['epoch'])}; checkpoint={checkpoint}", flush=True)
     finally:
         for dataset in datasets.values():
@@ -693,6 +740,8 @@ def main():
             real_dataset.close()
         if real_validation_dataset is not None:
             real_validation_dataset.close()
+        if real_test_dataset is not None:
+            real_test_dataset.close()
         for partition_datasets in crop_datasets.values():
             for dataset in partition_datasets.values():
                 dataset.close()

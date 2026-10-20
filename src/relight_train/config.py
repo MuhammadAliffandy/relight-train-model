@@ -104,9 +104,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
     if real_data is not None:
         if not isinstance(real_data, dict):
             raise ValueError("real_data must be a mapping")
-        for key in ("manifest", "pseudo_depth_root", "validation_manifest"):
+        for key in ("manifest", "pseudo_depth_root", "validation_manifest", "test_manifest"):
             if key not in real_data:
-                if key == "validation_manifest":
+                if key in ("validation_manifest", "test_manifest"):
                     continue
                 raise ValueError(f"real_data.{key} is required")
             real_data[key] = _expand_path(real_data[key])

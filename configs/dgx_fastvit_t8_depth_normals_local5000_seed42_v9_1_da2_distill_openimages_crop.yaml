@@ -1,10 +1,10 @@
 experiment:
   name: fastvit_t8_fpn72_v9_1_da2_distill_openimages1k_crop_synth5k_seed42_384x512_pilot
   seed: 42
-  epochs: 12
+  epochs: 20
   early_stopping:
-    min_epochs: 4
-    patience: 3
+    min_epochs: 5
+    patience: 4
     min_delta: 0.003
   batch_size: 8
   workers: 2
@@ -64,6 +64,7 @@ data:
 real_data:
   manifest: ./data/v9_openimages_people/manifest_train.jsonl
   validation_manifest: ./data/v9_openimages_people/manifest_val.jsonl
+  test_manifest: ./data/v9_openimages_people/manifest_test.jsonl
   pseudo_depth_root: ./data/v9_openimages_people/pseudo_depth
   batch_size: 2
   batches_per_synth_batch: 1

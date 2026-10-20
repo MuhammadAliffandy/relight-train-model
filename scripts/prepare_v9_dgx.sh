@@ -40,10 +40,11 @@ else
   echo "Reusing existing Open Images manifest"
 fi
 
-echo "Creating deterministic 80/20 real-image distillation split"
+echo "Creating deterministic 80/10/10 real-image distillation split"
 run_env scripts/split_v9_real_manifest.py \
   --manifest "$PROJECT_ROOT/data/v9_openimages_people/manifest.jsonl" \
-  --validation-fraction 0.2 \
+  --validation-fraction 0.1 \
+  --test-fraction 0.1 \
   --seed 42
 
 echo "Generating frozen Depth Anything V2 teacher maps"

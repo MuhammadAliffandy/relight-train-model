@@ -160,16 +160,20 @@ tail -f logs/v9_da2_distill_launcher.log
 
 The V9 run writes its own `runs/fastvit_t8_fpn72_v9_da2_distill_openimages1k_synth5k_seed42_384x512_pilot/` directory and never overwrites V8. Logs include `distill_depth`; `history.json` also records its average per epoch. The trainer's current early-stopping and checkpoint selection use SynthHuman validation and crop metrics, not a pseudo-label metric.
 
-### V9.1: paired real-image crops and a real pseudo-depth holdout
+### V9.1: paired real-image crops and real-photo checkpoint selection
 
-V9.1 keeps the V9 best checkpoint as its initialization and continues frozen-teacher depth distillation. The preparation script creates a deterministic 80/20 split of the Open Images manifest. Only the 80% training split contributes gradients; the held-out 20% is evaluated against its frozen teacher maps each epoch and logged as `real_pseudo_depth` in the console and `real_val_distill_depth` in `history.json`. Real training images receive synchronized crop/zoom transformations with their teacher depth maps (`crop_probability: 0.5`, zoom 1.25–2.0). SynthHuman depth and normal supervision and its crop validation remain active. The real pseudo-depth validation metric is diagnostic; early stopping and best-checkpoint selection still use labeled SynthHuman validation because teacher predictions are not ground truth.
+V9.1 initializes from the V9 best checkpoint and continues frozen Depth Anything V2 depth distillation. The Open Images manifest is split deterministically into 80% train, 10% validation, and 10% test. Only train images contribute distillation gradients. Validation pseudo-depth agreement selects the checkpoint and drives early stopping; the V9 initialization is the fallback if no epoch improves the real-photo validation score. The separate test split is evaluated once after selecting the checkpoint. These are teacher-agreement metrics, not ground-truth accuracy. SynthHuman depth/normal full-frame and crop metrics remain in every epoch as labeled regression monitors. Real training images receive synchronized crop/zoom transformations with their teacher maps (`crop_probability: 0.5`, zoom 1.25–2.0). The run allows up to 20 epochs, with early stopping after at least 5 epochs and 4 stale epochs; 20 is a ceiling for this pilot, not a claim that every dataset needs exactly 20 epochs.
 
-After V9 has completed and its best checkpoint is present, sync the latest repo and prepare the deterministic split and any missing inputs:
+After V9 has completed and its best checkpoint is present, sync the latest repo. If the Open Images photos and teacher maps already exist, just regenerate the deterministic 80/10/10 split:
 
 ```bash
 git pull --ff-only origin main
-V9_REAL_SAMPLES=1000 ./scripts/prepare_v9_dgx.sh
+conda run -n relight-dgx --no-capture-output python scripts/split_v9_real_manifest.py \
+  --manifest data/v9_openimages_people/manifest.jsonl \
+  --validation-fraction 0.1 --test-fraction 0.1 --seed 42
 ```
+
+Run `prepare_v9_dgx.sh` only if the Open Images photos or Depth Anything V2 maps are missing.
 
 Then launch V9.1 into its own run directory:
 
