@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -97,6 +98,34 @@ def copy_parquet(source, destination, expected_files):
             raise RuntimeError(f"Copy size mismatch for {path.name}: {partial.stat().st_size} != {size}")
         partial.replace(target)
     log(f"Copy complete: {len(source_files)} Parquet files in {destination}")
+
+
+def copy_rclone(remote, destination, expected_files):
+    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        listing = subprocess.run(
+            ["rclone", "lsf", remote, "--recursive", "--files-only"],
+            check=True, capture_output=True, text=True,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("rclone is not installed or is not in PATH on DGX") from error
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"Cannot list {remote}: {error.stderr.strip()}") from error
+    names = [line for line in listing.stdout.splitlines() if line.endswith(".parquet")]
+    if len(names) != expected_files:
+        raise RuntimeError(f"Expected {expected_files} Parquet files in {remote}, found {len(names)}")
+    log(f"Remote has {len(names)} Parquet files. Copying directly with rclone, bypassing the xxdrive mount")
+    subprocess.run(
+        [
+            "rclone", "copy", remote, str(destination),
+            "--stats", "10s", "--stats-one-line", "--stats-log-level", "NOTICE",
+            "--transfers", "2", "--checkers", "4", "--retries", "10",
+            "--low-level-retries", "20",
+        ],
+        check=True,
+    )
+    check_file_list(files_under(destination), expected_files)
+    log(f"Rclone copy complete: {len(names)} Parquet files in {destination}")
 
 
 def image_bytes(value, column, sample_id):
@@ -246,6 +275,10 @@ def main():
         default=Path.home() / "xxdrive/AppleCapstoneRelighting/datasets/face_depth_3d",
     )
     parser.add_argument("--output", type=Path, default=Path("data/face_depth_3d"))
+    parser.add_argument(
+        "--rclone-remote", default=None,
+        help="Read directly from this rclone remote instead of the xxdrive FUSE mount",
+    )
     parser.add_argument("--copy-only", action="store_true")
     parser.add_argument("--extract-only", action="store_true")
     parser.add_argument("--expected-files", type=int, default=EXPECTED_FILES)
@@ -257,9 +290,19 @@ def main():
     output = args.output.expanduser().resolve()
     parquet_root = output / "parquet"
     if not args.extract_only:
-        if not source.is_dir():
-            raise FileNotFoundError(f"xxdrive dataset directory not found: {source}")
-        copy_parquet(source, parquet_root, args.expected_files)
+        if args.rclone_remote:
+            copy_rclone(args.rclone_remote, parquet_root, args.expected_files)
+        else:
+            try:
+                available = source.is_dir()
+            except OSError as error:
+                raise RuntimeError(
+                    f"Cannot read xxdrive mount at {source}: {error}. "
+                    "Use --rclone-remote xxdrive:AppleCapstoneRelighting/datasets/face_depth_3d"
+                ) from error
+            if not available:
+                raise FileNotFoundError(f"xxdrive dataset directory not found: {source}")
+            copy_parquet(source, parquet_root, args.expected_files)
     if not args.copy_only:
         extract_parquet(parquet_root, output, args.expected_files, args.expected_rows)
 
