@@ -5,6 +5,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_NAME="${RELIGHT_CONDA_ENV:-relight-dgx}"
 SAMPLES="${V9_REAL_SAMPLES:-1000}"
 V8_CHECKPOINT="$PROJECT_ROOT/runs/fastvit_t8_fpn72_v8_moderate_crop_50k_seed42_384x512_30ep/best_checkpoint.pt"
+V9_CONFIG="$PROJECT_ROOT/configs/dgx_fastvit_t8_depth_normals_local5000_seed42_v9_da2_distill_pilot.yaml"
 
 run_env() {
   if [[ ${CONDA_DEFAULT_ENV:-} == "$ENV_NAME" ]]; then
@@ -23,6 +24,9 @@ fi
 export PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HOME="${HF_HOME:-$PROJECT_ROOT/.cache/relight_runtime/huggingface}"
 mkdir -p "$HF_HOME" "$PROJECT_ROOT/logs"
+
+echo "Staging the exact 5,000-sample SynthHuman subset required by V9"
+"$PROJECT_ROOT/scripts/stage_dgx_subset.sh" "$V9_CONFIG"
 
 echo "Installing V9 data and teacher dependencies in $ENV_NAME"
 run_env -m pip install "fiftyone>=1.0,<2" "transformers>=4.45,<5" safetensors
