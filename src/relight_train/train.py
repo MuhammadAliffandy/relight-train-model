@@ -26,6 +26,26 @@ from relight_train.model import PortraitGeometryModel
 from relight_train.objectives import GeometryObjective, evaluate, pseudo_depth_distillation_loss
 
 
+def evaluate_pseudo_depth(model, loader, device):
+    if loader is None:
+        return None
+    was_training = model.training
+    model.eval()
+    losses = []
+    with torch.inference_mode():
+        for real_x, teacher_depth, teacher_valid in loader:
+            real_x = real_x.to(device, non_blocking=True)
+            teacher_depth = teacher_depth.to(device, non_blocking=True)
+            teacher_valid = teacher_valid.to(device, non_blocking=True)
+            predicted_depth, _ = model(real_x)
+            losses.append(float(pseudo_depth_distillation_loss(
+                predicted_depth, teacher_depth, teacher_valid
+            )))
+    if was_training:
+        model.train()
+    return float(np.mean(losses)) if losses else float("nan")
+
+
 def atomic_json(path: Path, value):
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
@@ -117,10 +137,13 @@ def main():
     selection_material = "\n".join(sorted(row["subject_id"] for row in rows))
     real_cfg = config.get("real_data")
     if real_cfg:
-        real_manifest = Path(real_cfg["manifest"])
-        if not real_manifest.is_file():
-            raise FileNotFoundError(f"V9 real-data manifest not found: {real_manifest}")
-        selection_material += "\nreal_manifest_sha256=" + hashlib.sha256(real_manifest.read_bytes()).hexdigest()
+        for manifest_key in ("manifest", "validation_manifest"):
+            if not real_cfg.get(manifest_key):
+                continue
+            real_manifest = Path(real_cfg[manifest_key])
+            if not real_manifest.is_file():
+                raise FileNotFoundError(f"V9 real-data {manifest_key} not found: {real_manifest}")
+            selection_material += f"\nreal_{manifest_key}_sha256=" + hashlib.sha256(real_manifest.read_bytes()).hexdigest()
     selection_sha256 = hashlib.sha256(selection_material.encode("utf-8")).hexdigest()
     part_sizes = {key: len(value) for key, value in partitions.items()}
     print(f"Raw dataset manifest ready: {sum(part_sizes.values()):,} samples; split={part_sizes}; inventory={inventory}", flush=True)
@@ -141,9 +164,13 @@ def main():
     loaders = {key: DataLoader(value, batch_size=int(exp["batch_size"]), shuffle=False, persistent_workers=persistent_workers, **loader_options) for key, value in datasets.items()}
     real_dataset = None
     real_loader = None
+    real_validation_dataset = None
+    real_validation_loader = None
     if real_cfg:
         real_dataset = RealPseudoDepthDataset(
-            real_cfg["manifest"], real_cfg["pseudo_depth_root"], exp["input_size"]
+            real_cfg["manifest"], real_cfg["pseudo_depth_root"], exp["input_size"],
+            crop_probability=float(real_cfg.get("crop_probability", 0.0)),
+            crop_zoom_range=real_cfg.get("crop_zoom_range", (1.25, 2.0)),
         )
         real_loader = DataLoader(
             real_dataset,
@@ -155,10 +182,27 @@ def main():
             persistent_workers=persistent_workers,
             **({"prefetch_factor": int(exp.get("prefetch_factor", 2))} if workers > 0 else {}),
         )
+        if real_cfg.get("validation_manifest"):
+            real_validation_dataset = RealPseudoDepthDataset(
+                real_cfg["validation_manifest"], real_cfg["pseudo_depth_root"], exp["input_size"]
+            )
+            real_validation_loader = DataLoader(
+                real_validation_dataset,
+                batch_size=int(real_cfg["batch_size"]),
+                shuffle=False,
+                num_workers=workers,
+                pin_memory=True,
+                drop_last=False,
+                persistent_workers=persistent_workers,
+                **({"prefetch_factor": int(exp.get("prefetch_factor", 2))} if workers > 0 else {}),
+            )
         print(
             "Real-image depth distillation active: "
             f"images={len(real_dataset):,} batches/step={int(real_cfg['batches_per_synth_batch'])} "
-            f"weight={float(real_cfg['distillation_weight']):.4f}; normals remain SynthHuman-supervised.",
+            f"weight={float(real_cfg['distillation_weight']):.4f} "
+            f"crop_p={float(real_cfg.get('crop_probability', 0.0)):.2f}; "
+            f"real_val={len(real_validation_dataset) if real_validation_dataset else 0}; "
+            "normals remain SynthHuman-supervised.",
             flush=True,
         )
     crop_validation = exp.get("crop_validation")
@@ -552,6 +596,7 @@ def main():
                 label: evaluate(model, crop_loader, device, detail_metrics=True)
                 for label, crop_loader in crop_loaders["val"].items()
             }
+            real_val_distill_depth = evaluate_pseudo_depth(model, real_validation_loader, device)
             torch.cuda.synchronize()
             val_seconds = time.perf_counter() - val_start
             preview_x, preview_d, preview_n, preview_m = next(iter(loaders["val"]))
@@ -592,7 +637,7 @@ def main():
                     and stale_epochs >= int(early_stopping["patience"])
                 )
             peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
-            record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "crop_val": crop_val_metrics, "selection_score": score, "full_score": full_score, "crop_normal_score": crop_normal_score, "crop_silog_score": crop_silog_score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[-1]["lr"], "encoder_lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
+            record = {"epoch": epoch + 1, "session_data_wait_seconds": data_wait, "peak_gpu_memory_gib": peak_memory, "train_loss": float(np.mean(train_totals)), **{key: float(np.mean(value)) for key, value in task_totals.items()}, "val": val_metrics, "crop_val": crop_val_metrics, "real_val_distill_depth": real_val_distill_depth, "selection_score": score, "full_score": full_score, "crop_normal_score": crop_normal_score, "crop_silog_score": crop_silog_score, "train_seconds": train_seconds, "validation_seconds": val_seconds, "epoch_seconds": epoch_seconds, "train_samples_per_second": sample_rate, "eta_seconds": eta, "lr": optimizer.param_groups[-1]["lr"], "encoder_lr": optimizer.param_groups[0]["lr"], "task_sigmas": torch.exp(objective.log_vars.detach()).cpu().tolist(), "steps_per_epoch": train_steps, "train_samples": part_sizes["train"], "validation_samples": part_sizes["val"], "preview_matrix": str(preview_path)}
             if early_stopping:
                 record.update(early_stop_wait=stale_epochs,
                               early_stop_reference_score=early_stop_reference_score,
@@ -617,7 +662,11 @@ def main():
                 f" crop_{label}_normal={values['normal_mean_deg']:.2f}deg crop_{label}_SILog={values['depth_silog_x100']:.2f}"
                 for label, values in crop_val_metrics.items()
             )
-            print(f"epoch {epoch + 1:03d}/{exp['epochs']} iterations={train_steps:,} train={record['train_loss']:.4f} val depth(RMSE m)={val_metrics['depth_rmse_m']:.4f} normal(mean°)={val_metrics['normal_mean_deg']:.2f}{crop_summary} score={score:.4f} train={train_seconds / 60:.1f}m val={val_seconds / 60:.1f}m rate={sample_rate:.1f} samples/s ETA={eta / 60:.1f}m", flush=True)
+            real_val_summary = (
+                f" real_pseudo_depth={real_val_distill_depth:.4f}"
+                if real_val_distill_depth is not None else ""
+            )
+            print(f"epoch {epoch + 1:03d}/{exp['epochs']} iterations={train_steps:,} train={record['train_loss']:.4f} val depth(RMSE m)={val_metrics['depth_rmse_m']:.4f} normal(mean°)={val_metrics['normal_mean_deg']:.2f}{crop_summary}{real_val_summary} score={score:.4f} train={train_seconds / 60:.1f}m val={val_seconds / 60:.1f}m rate={sample_rate:.1f} samples/s ETA={eta / 60:.1f}m", flush=True)
             if early_stopped:
                 print(f"Early stopping at epoch {epoch + 1}: validation score has not improved by {min_delta:.4f} for {stale_epochs} epochs; best checkpoint remains {checkpoint}.", flush=True)
                 break
@@ -642,6 +691,8 @@ def main():
             dataset.close()
         if real_dataset is not None:
             real_dataset.close()
+        if real_validation_dataset is not None:
+            real_validation_dataset.close()
         for partition_datasets in crop_datasets.values():
             for dataset in partition_datasets.values():
                 dataset.close()

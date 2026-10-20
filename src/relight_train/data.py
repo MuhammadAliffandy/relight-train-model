@@ -242,10 +242,23 @@ class RawSynthHumanDataset(Dataset):
 class RealPseudoDepthDataset(Dataset):
     """Unlabeled real RGB images paired with frozen-teacher relative-depth maps."""
 
-    def __init__(self, manifest_path: Path, pseudo_depth_root: Path, input_size):
+    def __init__(
+        self, manifest_path: Path, pseudo_depth_root: Path, input_size,
+        crop_probability=0.0, crop_zoom_range=(1.25, 2.0),
+    ):
         self.manifest_path = Path(manifest_path)
         self.pseudo_depth_root = Path(pseudo_depth_root)
         self.input_size = tuple(int(value) for value in input_size)
+        self.crop_probability = float(crop_probability)
+        self.crop_zoom_range = tuple(float(value) for value in crop_zoom_range)
+        if not 0.0 <= self.crop_probability <= 1.0:
+            raise ValueError("crop_probability must be between zero and one")
+        if (
+            len(self.crop_zoom_range) != 2
+            or self.crop_zoom_range[0] <= 1.0
+            or self.crop_zoom_range[1] < self.crop_zoom_range[0]
+        ):
+            raise ValueError("crop_zoom_range must be [minimum, maximum] with 1 < minimum <= maximum")
         self.rows = [
             json.loads(line)
             for line in self.manifest_path.read_text(encoding="utf-8").splitlines()
@@ -301,6 +314,32 @@ class RealPseudoDepthDataset(Dataset):
             ),
             dtype=np.float32,
         )
+        if self.crop_probability and random.random() < self.crop_probability:
+            height, width = self.input_size
+            zoom = random.uniform(*self.crop_zoom_range)
+            crop_height = max(32, round(height / zoom))
+            crop_width = max(32, round(width / zoom))
+            top = random.randint(0, height - crop_height)
+            left = random.randint(0, width - crop_width)
+            box = (left, top, left + crop_width, top + crop_height)
+            image = np.asarray(
+                Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8))
+                .crop(box)
+                .resize((width, height), Image.Resampling.BILINEAR),
+                dtype=np.float32,
+            ) / 255.0
+            pseudo_depth = np.asarray(
+                Image.fromarray(pseudo_depth).crop(box).resize(
+                    (width, height), Image.Resampling.BILINEAR
+                ),
+                dtype=np.float32,
+            )
+            valid = np.asarray(
+                Image.fromarray(valid.astype(np.uint8)).crop(box).resize(
+                    (width, height), Image.Resampling.NEAREST
+                ),
+                dtype=np.uint8,
+            ) > 0
         pseudo_depth = np.where(valid, pseudo_depth, 0.0)
         image = (image - np.array([0.485, 0.456, 0.406], np.float32)) / np.array([0.229, 0.224, 0.225], np.float32)
         return (

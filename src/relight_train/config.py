@@ -104,7 +104,11 @@ def load_config(path: str | Path) -> dict[str, Any]:
     if real_data is not None:
         if not isinstance(real_data, dict):
             raise ValueError("real_data must be a mapping")
-        for key in ("manifest", "pseudo_depth_root"):
+        for key in ("manifest", "pseudo_depth_root", "validation_manifest"):
+            if key not in real_data:
+                if key == "validation_manifest":
+                    continue
+                raise ValueError(f"real_data.{key} is required")
             real_data[key] = _expand_path(real_data[key])
         if int(real_data.get("batch_size", 0)) < 1:
             raise ValueError("real_data.batch_size must be positive")
@@ -112,4 +116,13 @@ def load_config(path: str | Path) -> dict[str, Any]:
             raise ValueError("real_data.batches_per_synth_batch must be positive")
         if float(real_data.get("distillation_weight", -1)) < 0:
             raise ValueError("real_data.distillation_weight must be nonnegative")
+        if not 0 <= float(real_data.get("crop_probability", 0.0)) <= 1:
+            raise ValueError("real_data.crop_probability must be between zero and one")
+        crop_zoom = real_data.get("crop_zoom_range", [1.25, 2.0])
+        if (
+            not isinstance(crop_zoom, (list, tuple))
+            or len(crop_zoom) != 2
+            or not 1 < float(crop_zoom[0]) <= float(crop_zoom[1])
+        ):
+            raise ValueError("real_data.crop_zoom_range must be [minimum, maximum] with 1 < minimum <= maximum")
     return config

@@ -159,3 +159,23 @@ tail -f logs/v9_da2_distill_launcher.log
 ```
 
 The V9 run writes its own `runs/fastvit_t8_fpn72_v9_da2_distill_openimages1k_synth5k_seed42_384x512_pilot/` directory and never overwrites V8. Logs include `distill_depth`; `history.json` also records its average per epoch. The trainer's current early-stopping and checkpoint selection use SynthHuman validation and crop metrics, not a pseudo-label metric.
+
+### V9.1: paired real-image crops and a real pseudo-depth holdout
+
+V9.1 keeps the V9 best checkpoint as its initialization and continues frozen-teacher depth distillation. The preparation script creates a deterministic 80/20 split of the Open Images manifest. Only the 80% training split contributes gradients; the held-out 20% is evaluated against its frozen teacher maps each epoch and logged as `real_pseudo_depth` in the console and `real_val_distill_depth` in `history.json`. Real training images receive synchronized crop/zoom transformations with their teacher depth maps (`crop_probability: 0.5`, zoom 1.25–2.0). SynthHuman depth and normal supervision and its crop validation remain active. The real pseudo-depth validation metric is diagnostic; early stopping and best-checkpoint selection still use labeled SynthHuman validation because teacher predictions are not ground truth.
+
+After V9 has completed and its best checkpoint is present, sync the latest repo and prepare the deterministic split and any missing inputs:
+
+```bash
+git pull --ff-only origin main
+V9_REAL_SAMPLES=1000 ./scripts/prepare_v9_dgx.sh
+```
+
+Then launch V9.1 into its own run directory:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 nohup ./scripts/train_dgx.sh \
+  configs/dgx_fastvit_t8_depth_normals_local5000_seed42_v9_1_da2_distill_openimages_crop.yaml \
+  > logs/v9_1_da2_distill_launcher.log 2>&1 < /dev/null &
+tail -f logs/v9_1_da2_distill_launcher.log
+```
