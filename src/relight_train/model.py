@@ -52,12 +52,12 @@ class DepthwiseSeparableBlock(nn.Module):
 class CompactFPN(nn.Module):
     def __init__(self, channels, width=48, fusion="add"):
         super().__init__()
-        if fusion not in ("add", "concat"):
-            raise ValueError(f"Unsupported FPN fusion {fusion!r}; expected 'add' or 'concat'.")
+        if fusion not in ("add", "concat", "concat_all"):
+            raise ValueError(f"Unsupported FPN fusion {fusion!r}; expected 'add', 'concat', or 'concat_all'.")
         self.fusion = fusion
         self.lateral = nn.ModuleList([nn.Conv2d(channel, width, 1) for channel in channels])
         self.fusions = nn.ModuleList()
-        if fusion == "concat":
+        if fusion in ("concat", "concat_all"):
             self.fusions = nn.ModuleList([nn.Conv2d(width * 2, width, 1) for _ in channels[:-1]])
             # Start from the exact behavior of element-wise addition, then learn the fusion.
             for layer in self.fusions:
@@ -68,17 +68,31 @@ class CompactFPN(nn.Module):
                         layer.weight[channel, channel, 0, 0] = 1.0
                         layer.weight[channel, width + channel, 0, 0] = 1.0
         self.smooth = nn.ModuleList([DepthwiseSeparableBlock(width) for _ in channels])
+        if fusion == "concat_all":
+            self.all_stage_fusion = nn.Conv2d(width * len(channels), width, 1)
+            nn.init.zeros_(self.all_stage_fusion.weight)
+            nn.init.zeros_(self.all_stage_fusion.bias)
 
     def forward(self, features):
-        output = self.smooth[-1](self.lateral[-1](features[-1]))
+        lateral_features = [layer(feature) for layer, feature in zip(self.lateral, features)]
+        output = self.smooth[-1](lateral_features[-1])
         for index in range(len(features) - 2, -1, -1):
             output = F.interpolate(output, size=features[index].shape[-2:], mode="bilinear", align_corners=False)
-            lateral = self.lateral[index](features[index])
+            lateral = lateral_features[index]
             if self.fusion == "add":
                 merged = output + lateral
             else:
                 merged = self.fusions[index](torch.cat((output, lateral), dim=1))
             output = self.smooth[index](merged)
+        if self.fusion == "concat_all":
+            size = lateral_features[0].shape[-2:]
+            aligned = [
+                feature if feature.shape[-2:] == size else F.interpolate(
+                    feature, size=size, mode="bilinear", align_corners=False
+                )
+                for feature in lateral_features
+            ]
+            output = output + self.all_stage_fusion(torch.cat(aligned, dim=1))
         return output
 
 

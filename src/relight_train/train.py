@@ -334,7 +334,10 @@ def main():
                 if source_experiment.get(key) != exp.get(key)
             }
             source_fusion = str(source_experiment.get("fpn_fusion", "add"))
-            if source_fusion != fpn_fusion and not (source_fusion == "add" and fpn_fusion == "concat"):
+            if source_fusion != fpn_fusion and not (
+                (source_fusion == "add" and fpn_fusion in ("concat", "concat_all"))
+                or (source_fusion == "concat" and fpn_fusion == "concat_all")
+            ):
                 mismatches["fpn_fusion"] = (source_fusion, fpn_fusion)
             source_refinement = str(source_experiment.get("decoder_refinement", "none"))
             if source_refinement != decoder_refinement and not (
@@ -348,9 +351,13 @@ def main():
             else:
                 loaded = model.load_state_dict(initial_state["model"], strict=False)
                 expected_missing = set()
-                if source_fusion != fpn_fusion:
+                if source_fusion == "add" and fpn_fusion in ("concat", "concat_all"):
                     expected_missing.update(
                         key for key in model.state_dict() if key.startswith("neck.fusions.")
+                    )
+                if fpn_fusion == "concat_all" and source_fusion != "concat_all":
+                    expected_missing.update(
+                        key for key in model.state_dict() if key.startswith("neck.all_stage_fusion.")
                     )
                 if source_refinement != decoder_refinement:
                     expected_missing.update(
@@ -362,7 +369,7 @@ def main():
                         f"missing={loaded.missing_keys}, unexpected={loaded.unexpected_keys}"
                     )
                 if source_fusion != fpn_fusion:
-                    print("Transferred additive FPN weights; new concat layers start as exact addition.", flush=True)
+                    print("Transferred FPN weights; newly added fusion layers start at the source model output.", flush=True)
                 if source_refinement != decoder_refinement:
                     print("Transferred V2 weights; stride-2 refinement starts with zero output corrections.", flush=True)
             if "objective" in initial_state:
