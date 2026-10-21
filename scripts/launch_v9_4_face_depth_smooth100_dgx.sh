@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 INIT="runs/fastvit_t8_fpn72_v9_3_face_depth3d_concatall_512/best_checkpoint.pt"
 MANIFEST="data/face_depth_3d/manifest.jsonl"
@@ -14,6 +15,7 @@ test -f "$INIT" || { echo "Checkpoint V9.3 tidak ditemukan: $INIT"; exit 1; }
 test -f "$MANIFEST" || { echo "Manifest FaceDepth tidak ditemukan: $MANIFEST"; exit 1; }
 test ! -e "$RUN" || { echo "Run directory sudah ada: $RUN; pilih nama run baru agar hasil lama aman."; exit 1; }
 mkdir -p logs
+python -c 'from relight_train.model import PortraitGeometryModel'
 
 if [ -f "$PID_FILE" ]; then
   OLD_PID="$(cat "$PID_FILE")"
