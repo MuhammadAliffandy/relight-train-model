@@ -69,7 +69,11 @@ def edge_aware_smoothness_loss(predicted_depth, rgb, valid_mask):
         if int(valid.sum()) < 64:
             continue
         values = inverse_depth[index, 0]
-        low, high = torch.quantile(values[valid], values.new_tensor([0.05, 0.95]))
+        sampled_valid = valid[::4, ::4]
+        reference = values.detach()[::4, ::4][sampled_valid]
+        if reference.numel() < 64:
+            reference = values.detach()[valid]
+        low, high = torch.quantile(reference, values.new_tensor([0.05, 0.95]))
         normalized = ((values - low) / (high - low).clamp_min(1e-4)).clamp(0, 1)
 
         valid_x = valid[:, 1:] & valid[:, :-1]
@@ -103,6 +107,7 @@ def main():
     parser.add_argument("--smoothness-weight", type=float, default=0.05)
     parser.add_argument("--snapshot-interval", type=int, default=25)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--encoder-lr", type=float, default=1e-6)
     parser.add_argument("--head-lr", type=float, default=1e-5)
@@ -110,8 +115,8 @@ def main():
     if args.size % 32 or args.size < 32 or min(args.batch_size, args.epochs, args.patience) < 1:
         parser.error("size must be a positive multiple of 32; batch-size, epochs, patience must be positive")
     if (args.workers < 0 or args.min_delta < 0 or args.smoothness_weight < 0
-            or args.snapshot_interval < 1):
-        parser.error("workers, min-delta, and smoothness-weight must be nonnegative; snapshot-interval must be positive")
+            or args.snapshot_interval < 1 or args.log_every < 1):
+        parser.error("workers, min-delta, and smoothness-weight must be nonnegative; snapshot-interval and log-every must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for DGX training")
     random.seed(args.seed)
@@ -168,7 +173,7 @@ def main():
                 "fusion": args.fusion, "init_checkpoint": str(args.init_checkpoint),
                 "epochs": args.epochs, "patience": args.patience, "min_delta": args.min_delta,
                 "smoothness_weight": args.smoothness_weight,
-                "snapshot_interval": args.snapshot_interval}
+                "snapshot_interval": args.snapshot_interval, "log_every": args.log_every}
     (args.run_dir / "experiment.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     best = float("inf")
     stale = 0
@@ -177,7 +182,15 @@ def main():
         model.train()
         model.normal_head.eval()
         totals = []
-        for step, (rgb, proximity, valid) in enumerate(train_loader, 1):
+        print(f"Epoch {epoch}/{args.epochs} creating data iterator", flush=True)
+        train_iterator = iter(train_loader)
+        for step in range(1, len(train_loader) + 1):
+            should_log = step % args.log_every == 0 or step == 1 or step == len(train_loader)
+            if should_log:
+                print(f"Epoch {epoch}/{args.epochs} step {step}/{len(train_loader)} fetching batch", flush=True)
+            rgb, proximity, valid = next(train_iterator)
+            if should_log:
+                print(f"Epoch {epoch}/{args.epochs} step {step}/{len(train_loader)} computing", flush=True)
             rgb, proximity, valid = rgb.to(device), proximity.to(device), valid.to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -189,11 +202,14 @@ def main():
             loss.backward()
             optimizer.step()
             totals.append(float(loss.detach()))
-            if step % 50 == 0 or step == len(train_loader):
+            if should_log:
                 elapsed = max(time.monotonic() - started, 1e-6)
+                epoch_eta = (len(train_loader) - step) * elapsed / step / 60
+                gpu_memory = torch.cuda.memory_allocated() / (1024 ** 3)
                 print(f"Epoch {epoch}/{args.epochs} step {step}/{len(train_loader)} "
                       f"loss={np.mean(totals):.4f} smooth={float(smooth_loss.detach()):.4f} "
-                      f"{step * args.batch_size / elapsed:.1f} images/s", flush=True)
+                      f"{step * args.batch_size / elapsed:.1f} images/s "
+                      f"epoch_eta={epoch_eta:.1f}m gpu_alloc={gpu_memory:.1f}GiB", flush=True)
         model.eval()
         validation = []
         validation_smoothness = []

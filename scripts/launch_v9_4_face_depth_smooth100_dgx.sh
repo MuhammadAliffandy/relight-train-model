@@ -26,7 +26,16 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-nohup python -u scripts/train_face_depth3d_dgx.py \
+nohup bash -c '
+  python -u scripts/train_face_depth3d_dgx.py "$@" &
+  child=$!
+  forward_term() { kill "$child" 2>/dev/null || true; }
+  trap forward_term TERM INT
+  wait "$child"
+  status=$?
+  printf "TRAIN_EXIT_STATUS=%s\n" "$status"
+  exit "$status"
+' v9_4 \
   --manifest "$MANIFEST" \
   --init-checkpoint "$INIT" \
   --run-dir "$RUN" \
@@ -38,7 +47,8 @@ nohup python -u scripts/train_face_depth3d_dgx.py \
   --min-delta 0.00005 \
   --smoothness-weight 0.05 \
   --snapshot-interval 25 \
-  --workers 2 \
+  --workers 0 \
+  --log-every 1 \
   > "$LOG" 2>&1 < /dev/null &
 
 echo $! > "$PID_FILE"
