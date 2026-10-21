@@ -16,6 +16,7 @@ test -f "$MANIFEST" || { echo "Manifest FaceDepth tidak ditemukan: $MANIFEST"; e
 test ! -e "$RUN" || { echo "Run directory sudah ada: $RUN; pilih nama run baru agar hasil lama aman."; exit 1; }
 mkdir -p logs
 python -c 'from relight_train.model import PortraitGeometryModel'
+command -v setsid >/dev/null || { echo "setsid tidak ditemukan; tidak bisa memisahkan sesi training dari terminal."; exit 1; }
 
 if [ -f "$PID_FILE" ]; then
   OLD_PID="$(cat "$PID_FILE")"
@@ -26,11 +27,16 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-nohup bash -c '
+setsid nohup bash -c '
+  printf "TRAIN_WRAPPER_PID=%s\n" "$$"
   python -u scripts/train_face_depth3d_dgx.py "$@" &
   child=$!
-  forward_term() { kill "$child" 2>/dev/null || true; }
-  trap forward_term TERM INT
+  forward_signal() {
+    printf "TRAIN_WRAPPER_SIGNAL=%s\n" "$1"
+    kill "$child" 2>/dev/null || true
+  }
+  trap "forward_signal TERM" TERM
+  trap "forward_signal INT" INT
   wait "$child"
   status=$?
   printf "TRAIN_EXIT_STATUS=%s\n" "$status"
@@ -47,7 +53,7 @@ nohup bash -c '
   --min-delta 0.00005 \
   --smoothness-weight 0.05 \
   --snapshot-interval 25 \
-  --workers 0 \
+  --workers 2 \
   --log-every 1 \
   > "$LOG" 2>&1 < /dev/null &
 
