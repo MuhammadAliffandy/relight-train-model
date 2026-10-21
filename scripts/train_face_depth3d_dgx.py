@@ -60,6 +60,35 @@ def split_rows(path, seed):
     return train, validation, digest
 
 
+def edge_aware_smoothness_loss(predicted_depth, rgb, valid_mask):
+    """Smooth relative proximity inside valid regions while retaining RGB edges."""
+    inverse_depth = predicted_depth.float().clamp_min(1e-5).reciprocal()
+    losses = []
+    for index in range(predicted_depth.shape[0]):
+        valid = valid_mask[index, 0].bool()
+        if int(valid.sum()) < 64:
+            continue
+        values = inverse_depth[index, 0]
+        low, high = torch.quantile(values[valid], values.new_tensor([0.05, 0.95]))
+        normalized = ((values - low) / (high - low).clamp_min(1e-4)).clamp(0, 1)
+
+        valid_x = valid[:, 1:] & valid[:, :-1]
+        valid_y = valid[1:, :] & valid[:-1, :]
+        image = rgb[index].float()
+        image_dx = (image[:, :, 1:] - image[:, :, :-1]).abs().mean(0)
+        image_dy = (image[:, 1:, :] - image[:, :-1, :]).abs().mean(0)
+        weight_x = torch.exp(-10.0 * image_dx)
+        weight_y = torch.exp(-10.0 * image_dy)
+        depth_dx = (normalized[:, 1:] - normalized[:, :-1]).abs()
+        depth_dy = (normalized[1:, :] - normalized[:-1, :]).abs()
+        loss_x = (depth_dx * weight_x * valid_x).sum() / valid_x.sum().clamp_min(1)
+        loss_y = (depth_dy * weight_y * valid_y).sum() / valid_y.sum().clamp_min(1)
+        losses.append(0.5 * (loss_x + loss_y))
+    if not losses:
+        raise ValueError("A batch has no valid pixels for edge-aware smoothness")
+    return torch.stack(losses).mean()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=Path("data/face_depth_3d/manifest.jsonl"))
@@ -68,8 +97,11 @@ def main():
     parser.add_argument("--fusion", choices=("concat", "concat_all"), required=True)
     parser.add_argument("--size", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=100)
+    parser.add_argument("--min-delta", type=float, default=0.00005)
+    parser.add_argument("--smoothness-weight", type=float, default=0.05)
+    parser.add_argument("--snapshot-interval", type=int, default=25)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--encoder-lr", type=float, default=1e-6)
@@ -77,8 +109,9 @@ def main():
     args = parser.parse_args()
     if args.size % 32 or args.size < 32 or min(args.batch_size, args.epochs, args.patience) < 1:
         parser.error("size must be a positive multiple of 32; batch-size, epochs, patience must be positive")
-    if args.workers < 0:
-        parser.error("workers must be nonnegative")
+    if (args.workers < 0 or args.min_delta < 0 or args.smoothness_weight < 0
+            or args.snapshot_interval < 1):
+        parser.error("workers, min-delta, and smoothness-weight must be nonnegative; snapshot-interval must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for DGX training")
     random.seed(args.seed)
@@ -102,10 +135,16 @@ def main():
         residual_normal_limit=float(exp.get("residual_normal_limit", 0.15)),
         grayscale_refinement=bool(exp.get("grayscale_refinement", False)),
     )
-    if exp.get("fpn_fusion") != "concat" or exp.get("depth_mode") != "metric":
-        raise ValueError("Initialization must be a metric-depth V9 checkpoint with concat FPN")
+    source_fusion = exp.get("fpn_fusion")
+    if source_fusion not in {"concat", "concat_all"} or exp.get("depth_mode") != "metric":
+        raise ValueError("Initialization must be a metric-depth V9 checkpoint with concat or concat_all FPN")
+    if args.fusion != source_fusion and not (source_fusion == "concat" and args.fusion == "concat_all"):
+        raise ValueError(f"Cannot transfer FPN fusion {source_fusion!r} into {args.fusion!r} safely")
     loaded = model.load_state_dict(source["model"], strict=False)
-    expected_missing = {"neck.all_stage_fusion.weight", "neck.all_stage_fusion.bias"} if args.fusion == "concat_all" else set()
+    expected_missing = (
+        {"neck.all_stage_fusion.weight", "neck.all_stage_fusion.bias"}
+        if source_fusion == "concat" and args.fusion == "concat_all" else set()
+    )
     if set(loaded.missing_keys) != expected_missing or loaded.unexpected_keys:
         raise RuntimeError(f"Checkpoint transfer mismatch: {loaded}")
     for parameter in model.normal_head.parameters():
@@ -119,12 +158,17 @@ def main():
     loader_options = {"batch_size": args.batch_size, "num_workers": args.workers, "pin_memory": True}
     train_loader = DataLoader(FaceDepthDataset(train_rows, args.size), shuffle=True, **loader_options)
     val_loader = DataLoader(FaceDepthDataset(val_rows, args.size), shuffle=False, **loader_options)
-    experiment = dict(exp, input_size=[args.size, args.size], fpn_fusion=args.fusion,
+    experiment = dict(exp, name=args.run_dir.name, init_checkpoint=str(args.init_checkpoint),
+                      input_size=[args.size, args.size], fpn_fusion=args.fusion,
+                      edge_aware_smoothness_weight=args.smoothness_weight,
                       depth_training_target="Face-Depth-3D inferno index relative proximity",
                       normal_training=False)
     metadata = {"manifest_sha256": manifest_sha, "train_count": len(train_rows),
                 "validation_count": len(val_rows), "seed": args.seed, "size": args.size,
-                "fusion": args.fusion, "init_checkpoint": str(args.init_checkpoint)}
+                "fusion": args.fusion, "init_checkpoint": str(args.init_checkpoint),
+                "epochs": args.epochs, "patience": args.patience, "min_delta": args.min_delta,
+                "smoothness_weight": args.smoothness_weight,
+                "snapshot_interval": args.snapshot_interval}
     (args.run_dir / "experiment.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     best = float("inf")
     stale = 0
@@ -138,32 +182,53 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 predicted, _, coarse, _ = model(rgb, return_coarse=True)
-                loss = pseudo_depth_distillation_loss(predicted, proximity, valid)
-                loss = loss + 0.3 * pseudo_depth_distillation_loss(coarse, proximity, valid)
+                depth_loss = pseudo_depth_distillation_loss(predicted, proximity, valid)
+                coarse_loss = pseudo_depth_distillation_loss(coarse, proximity, valid)
+                smooth_loss = edge_aware_smoothness_loss(predicted, rgb, valid)
+                loss = depth_loss + 0.3 * coarse_loss + args.smoothness_weight * smooth_loss
             loss.backward()
             optimizer.step()
             totals.append(float(loss.detach()))
             if step % 50 == 0 or step == len(train_loader):
                 elapsed = max(time.monotonic() - started, 1e-6)
                 print(f"Epoch {epoch}/{args.epochs} step {step}/{len(train_loader)} "
-                      f"loss={np.mean(totals):.4f} {step * args.batch_size / elapsed:.1f} images/s", flush=True)
+                      f"loss={np.mean(totals):.4f} smooth={float(smooth_loss.detach()):.4f} "
+                      f"{step * args.batch_size / elapsed:.1f} images/s", flush=True)
         model.eval()
         validation = []
+        validation_smoothness = []
         with torch.inference_mode():
             for rgb, proximity, valid in val_loader:
                 rgb, proximity, valid = rgb.to(device), proximity.to(device), valid.to(device)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     predicted, _ = model(rgb)
                     validation.append(float(pseudo_depth_distillation_loss(predicted, proximity, valid)))
+                    validation_smoothness.append(float(edge_aware_smoothness_loss(predicted, rgb, valid)))
         score = float(np.mean(validation))
+        smooth_score = float(np.mean(validation_smoothness))
+        epoch_minutes = (time.monotonic() - started) / 60
         print(f"Epoch {epoch}: train={np.mean(totals):.5f} val={score:.5f} "
-              f"minutes={(time.monotonic() - started) / 60:.1f}", flush=True)
+              f"val_smooth={smooth_score:.5f} minutes={epoch_minutes:.1f}", flush=True)
+        with (args.run_dir / "history.jsonl").open("a", encoding="utf-8") as history_file:
+            history_file.write(json.dumps({
+                "epoch": epoch,
+                "train_loss": float(np.mean(totals)),
+                "validation_relative_loss": score,
+                "validation_smoothness_loss": smooth_score,
+                "minutes": epoch_minutes,
+            }) + "\n")
         payload = {"model": model.state_dict(), "experiment": experiment, "epoch": epoch,
-                   "validation_relative_loss": score, "manifest_sha256": manifest_sha}
+                   "validation_relative_loss": score, "validation_smoothness_loss": smooth_score,
+                   "manifest_sha256": manifest_sha}
         temporary = args.run_dir / "last_checkpoint.pt.tmp"
         torch.save(payload, temporary)
         temporary.replace(args.run_dir / "last_checkpoint.pt")
-        if score < best - 0.001:
+        if epoch % args.snapshot_interval == 0:
+            snapshot = args.run_dir / f"checkpoint_epoch_{epoch:03d}.pt"
+            temporary = snapshot.with_suffix(snapshot.suffix + ".tmp")
+            torch.save(payload, temporary)
+            temporary.replace(snapshot)
+        if score < best - args.min_delta:
             best = score
             stale = 0
             temporary = args.run_dir / "best_checkpoint.pt.tmp"
