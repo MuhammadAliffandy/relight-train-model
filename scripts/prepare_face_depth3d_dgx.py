@@ -190,7 +190,9 @@ def extract_parquet(parquet_root, output_root, expected_files, expected_rows):
     palette = (colormaps["inferno"](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.float32)
     manifest_rows = []
     done = 0
-    started = time.monotonic()
+    reused = 0
+    converted = 0
+    conversion_started = None
     log(f"Extracting {total_rows} samples at original resolution; inferno index is relative, not meters")
 
     for file_number, path in enumerate(files, 1):
@@ -200,31 +202,37 @@ def extract_parquet(parquet_root, output_root, expected_files, expected_rows):
             for row in batch.to_pylist():
                 sample_id = f"{path.stem}_{row_number:05d}"
                 photo_bytes = image_bytes(row["image"], "image", sample_id)
-                mask_bytes = image_bytes(row["output_mask"], "output_mask", sample_id)
                 with Image.open(io.BytesIO(photo_bytes)) as photo:
                     photo_size = photo.size
                     photo_format = photo.format
                 extension = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}.get(photo_format)
                 if extension is None:
                     raise RuntimeError(f"{sample_id}: unsupported source image format {photo_format}")
-                with Image.open(io.BytesIO(mask_bytes)) as mask:
-                    if mask.mode != "RGB" or mask.size != photo_size:
-                        raise RuntimeError(f"{sample_id}: mask format/size {mask.mode}, {mask.size} vs photo {photo_size}")
-                    mask_rgb = np.asarray(mask, dtype=np.uint8)
-                index_map, mean_error, bad_fraction = invert_inferno(mask_rgb, palette)
-                if mean_error > 4 or bad_fraction > 0.02:
-                    raise RuntimeError(
-                        f"{sample_id}: output_mask does not match inferno: "
-                        f"mean error={mean_error:.2f}, error>5={bad_fraction:.2%}"
-                    )
                 image_path = image_dir / f"{sample_id}{extension}"
                 label_path = label_dir / f"{sample_id}.png"
-                if not image_path.exists():
-                    atomic_bytes(image_path, photo_bytes)
-                if not label_path.exists():
-                    buffer = io.BytesIO()
-                    Image.fromarray(index_map, mode="L").save(buffer, format="PNG")
-                    atomic_bytes(label_path, buffer.getvalue())
+                if image_path.is_file() and label_path.is_file():
+                    reused += 1
+                else:
+                    if conversion_started is None:
+                        conversion_started = time.monotonic()
+                    mask_bytes = image_bytes(row["output_mask"], "output_mask", sample_id)
+                    with Image.open(io.BytesIO(mask_bytes)) as mask:
+                        if mask.mode != "RGB" or mask.size != photo_size:
+                            raise RuntimeError(f"{sample_id}: mask format/size {mask.mode}, {mask.size} vs photo {photo_size}")
+                        mask_rgb = np.asarray(mask, dtype=np.uint8)
+                    index_map, mean_error, bad_fraction = invert_inferno(mask_rgb, palette)
+                    if mean_error > 4 or bad_fraction > 0.02:
+                        raise RuntimeError(
+                            f"{sample_id}: output_mask does not match inferno: "
+                            f"mean error={mean_error:.2f}, error>5={bad_fraction:.2%}"
+                        )
+                    if not image_path.exists():
+                        atomic_bytes(image_path, photo_bytes)
+                    if not label_path.exists():
+                        buffer = io.BytesIO()
+                        Image.fromarray(index_map, mode="L").save(buffer, format="PNG")
+                        atomic_bytes(label_path, buffer.getvalue())
+                    converted += 1
                 mesh = row["glb_3d_file"]
                 match = re.match(r"^(task_[^ ]+)", mesh or "")
                 manifest_rows.append({
@@ -241,11 +249,13 @@ def extract_parquet(parquet_root, output_root, expected_files, expected_rows):
                 row_number += 1
                 done += 1
                 if done % 50 == 0 or done == total_rows:
-                    elapsed = max(time.monotonic() - started, 1e-6)
-                    rate = done / elapsed
+                    elapsed = max(time.monotonic() - conversion_started, 1e-6) if conversion_started else 0
+                    rate = converted / elapsed if elapsed else 0
+                    eta = (total_rows - done) / rate if rate else None
                     log(
                         f"Extract {done}/{total_rows} ({done / total_rows * 100:.1f}%)"
-                        f" | {rate:.1f} samples/s | ETA {duration((total_rows - done) / rate)}"
+                        f" | reused={reused} new={converted}"
+                        f" | {rate:.1f} new samples/s | ETA {duration(eta)}"
                     )
         if row_number != counts[file_number - 1]:
             raise RuntimeError(f"Row count mismatch while reading {path}")
@@ -260,6 +270,8 @@ def extract_parquet(parquet_root, output_root, expected_files, expected_rows):
     summary = {
         "parquet_files": len(files),
         "samples": len(manifest_rows),
+        "reused_on_this_run": reused,
+        "converted_on_this_run": converted,
         "label_encoding": "nearest matplotlib inferno index, uint8 0..255",
         "label_units": "relative index; not meters",
         "manifest": str(manifest_path.resolve()),
