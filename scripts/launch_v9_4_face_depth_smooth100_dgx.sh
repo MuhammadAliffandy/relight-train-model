@@ -10,6 +10,7 @@ MANIFEST="data/face_depth_3d/manifest.jsonl"
 RUN="runs/fastvit_t8_fpn72_v9_4_face_depth3d_smooth100_512"
 LOG="logs/v9_4_face_depth3d_smooth100_512.log"
 PID_FILE="logs/v9_4_face_depth3d_smooth100_512.pid"
+TRACE_LOG="logs/v9_4_face_depth3d_smooth100_512_signals_$(date +%Y%m%d_%H%M%S).log"
 
 test -f "$INIT" || { echo "Checkpoint V9.3 tidak ditemukan: $INIT"; exit 1; }
 test -f "$MANIFEST" || { echo "Manifest FaceDepth tidak ditemukan: $MANIFEST"; exit 1; }
@@ -17,6 +18,10 @@ test ! -e "$RUN" || { echo "Run directory sudah ada: $RUN; pilih nama run baru a
 mkdir -p logs
 python -c 'from relight_train.model import PortraitGeometryModel'
 command -v setsid >/dev/null || { echo "setsid tidak ditemukan; tidak bisa memisahkan sesi training dari terminal."; exit 1; }
+if [ "${FACE_DEPTH_TRACE_SIGNALS:-0}" = 1 ]; then
+  command -v strace >/dev/null || { echo "Mode trace memerlukan strace di DGX."; exit 1; }
+  export FACE_DEPTH_SIGNAL_TRACE_LOG="$TRACE_LOG"
+fi
 
 if [ -f "$PID_FILE" ]; then
   OLD_PID="$(cat "$PID_FILE")"
@@ -29,7 +34,13 @@ fi
 
 setsid nohup bash -c '
   printf "TRAIN_WRAPPER_PID=%s\n" "$$"
-  python -u scripts/train_face_depth3d_dgx.py "$@" &
+  if [ "${FACE_DEPTH_TRACE_SIGNALS:-0}" = 1 ]; then
+    strace -f -ttt -e trace=none -e signal=SIGTERM \
+      -o "$FACE_DEPTH_SIGNAL_TRACE_LOG" \
+      python -u scripts/train_face_depth3d_dgx.py "$@" &
+  else
+    python -u scripts/train_face_depth3d_dgx.py "$@" &
+  fi
   child=$!
   forward_signal() {
     printf "TRAIN_WRAPPER_SIGNAL=%s\n" "$1"
@@ -60,4 +71,5 @@ setsid nohup bash -c '
 echo $! > "$PID_FILE"
 echo "Training V9.4 dimulai. PID: $(cat "$PID_FILE")"
 echo "Log: $LOG"
+if [ "${FACE_DEPTH_TRACE_SIGNALS:-0}" = 1 ]; then echo "Signal trace: $TRACE_LOG"; fi
 echo "Pantau dengan: tail -f $LOG"
