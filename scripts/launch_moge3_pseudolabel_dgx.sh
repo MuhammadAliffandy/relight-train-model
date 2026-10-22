@@ -14,7 +14,6 @@ PID_FILE="${MOGE_PID_FILE:-logs/moge3_celebamask_hq_pseudolabel.pid}"
 test -d "$IMAGES" || { echo "Image directory missing: $IMAGES"; exit 1; }
 test -s "$CHECKPOINT" || { echo "MoGe checkpoint missing: $CHECKPOINT"; exit 1; }
 command -v setsid >/dev/null || { echo "setsid is required on DGX"; exit 1; }
-"$PYTHON" -c 'import torch; from moge.model.v3 import MoGeModel; assert torch.cuda.is_available(), "CUDA unavailable"'
 mkdir -p "$(dirname "$LOG")" "$(dirname "$PID_FILE")" "$OUTPUT"
 
 if [ -f "$PID_FILE" ]; then
@@ -25,6 +24,9 @@ if [ -f "$PID_FILE" ]; then
   fi
   rm -f "$PID_FILE"
 fi
+
+"$PYTHON" scripts/patch_flexgemm_triton32_dgx.py
+"$PYTHON" -c 'import torch; from moge.model.v3 import MoGeModel; assert torch.cuda.is_available(), "CUDA unavailable"'
 
 setsid nohup "$PYTHON" -u scripts/generate_moge3_pseudo_depth_dgx.py \
   --images "$IMAGES" --checkpoint "$CHECKPOINT" --output "$OUTPUT" "$@" \
