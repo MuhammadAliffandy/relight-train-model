@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove FlexGEMM pointer annotations that Triton 3.2 miscompiles."""
+"""Remove FlexGEMM JIT annotations that Triton 3.2 miscompiles."""
 
 from __future__ import annotations
 
@@ -12,11 +12,13 @@ import tempfile
 from pathlib import Path
 
 
-POINTER_ANNOTATION = re.compile(r"tl\.pointer_type(?:\s*\|\s*None)?\Z")
+UNSUPPORTED_ANNOTATION = re.compile(
+    r"(?:tl\.pointer_type(?:\s*\|\s*None)?|tl\.(?:tensor|const)\s*\|\s*None)\Z"
+)
 BACKUP_SUFFIX = ".moge_triton32.bak"
 
 
-def remove_pointer_annotations(source: bytes, path: Path) -> tuple[bytes, int]:
+def remove_unsupported_annotations(source: bytes, path: Path) -> tuple[bytes, int]:
     tree = ast.parse(source, filename=str(path))
     text = source.decode("utf-8")
     lines = source.splitlines(keepends=True)
@@ -29,12 +31,15 @@ def remove_pointer_annotations(source: bytes, path: Path) -> tuple[bytes, int]:
         if not isinstance(node, ast.arg) or node.annotation is None:
             continue
         annotation = ast.get_source_segment(text, node.annotation)
-        if annotation is None or not POINTER_ANNOTATION.fullmatch(annotation.strip()):
+        if annotation is None or not UNSUPPORTED_ANNOTATION.fullmatch(annotation.strip()):
             continue
         start = line_starts[node.lineno - 1] + node.col_offset + len(node.arg.encode("utf-8"))
         end = line_starts[node.annotation.end_lineno - 1] + node.annotation.end_col_offset
-        if not re.fullmatch(rb"\s*:\s*tl\.pointer_type(?:\s*\|\s*None)?", source[start:end]):
-            raise RuntimeError(f"Unexpected pointer annotation in {path}:{node.lineno}")
+        declaration = source[start:end].decode("utf-8")
+        if not declaration.lstrip().startswith(":") or not UNSUPPORTED_ANNOTATION.fullmatch(
+            declaration.split(":", 1)[1].strip()
+        ):
+            raise RuntimeError(f"Unexpected Triton annotation in {path}:{node.lineno}")
         edits.append((start, end))
 
     patched = source
@@ -62,7 +67,7 @@ def main() -> None:
     changed_files = total_annotations = 0
     for path in sorted(kernel_root.rglob("*.py")):
         original = path.read_bytes()
-        patched, count = remove_pointer_annotations(original, path)
+        patched, count = remove_unsupported_annotations(original, path)
         if not count:
             continue
         backup = path.with_name(path.name + BACKUP_SUFFIX)
@@ -81,7 +86,7 @@ def main() -> None:
 
     print(
         f"FlexGEMM/Triton {triton.__version__}: removed {total_annotations} "
-        f"pointer annotations in {changed_files} files; originals saved as *{BACKUP_SUFFIX}",
+        f"unsupported annotations in {changed_files} files; originals saved as *{BACKUP_SUFFIX}",
         flush=True,
     )
 
