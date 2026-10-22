@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove FlexGEMM JIT annotations that Triton 3.2 miscompiles."""
+"""Adjust FlexGEMM JIT syntax for Triton 3.2."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ UNSUPPORTED_ANNOTATION = re.compile(
 BACKUP_SUFFIX = ".moge_triton32.bak"
 
 
-def remove_unsupported_annotations(source: bytes, path: Path) -> tuple[bytes, int]:
+def patch_source(source: bytes, path: Path) -> tuple[bytes, int, int]:
     tree = ast.parse(source, filename=str(path))
     text = source.decode("utf-8")
     lines = source.splitlines(keepends=True)
@@ -26,7 +26,8 @@ def remove_unsupported_annotations(source: bytes, path: Path) -> tuple[bytes, in
     for line in lines:
         line_starts.append(line_starts[-1] + len(line))
 
-    edits = []
+    edits: list[tuple[int, int, bytes]] = []
+    annotation_count = 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.arg) or node.annotation is None:
             continue
@@ -40,21 +41,47 @@ def remove_unsupported_annotations(source: bytes, path: Path) -> tuple[bytes, in
             declaration.split(":", 1)[1].strip()
         ):
             raise RuntimeError(f"Unexpected Triton annotation in {path}:{node.lineno}")
-        edits.append((start, end))
+        edits.append((start, end, b""))
+        annotation_count += 1
+
+    insertions: dict[int, bytes] = {}
+    bool_chain_count = 0
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not any(
+            isinstance(decorator, ast.Attribute)
+            and isinstance(decorator.value, ast.Name)
+            and decorator.value.id == "triton"
+            and decorator.attr == "jit"
+            for decorator in function.decorator_list
+        ):
+            continue
+        for node in ast.walk(function):
+            if not isinstance(node, ast.BoolOp) or len(node.values) <= 2:
+                continue
+            for value in node.values[1:-1]:
+                start = line_starts[value.lineno - 1] + value.col_offset
+                insertions[start] = insertions.get(start, b"") + b"("
+            end = line_starts[node.end_lineno - 1] + node.end_col_offset
+            insertions[end] = insertions.get(end, b"") + b")" * (len(node.values) - 2)
+            bool_chain_count += 1
+
+    edits.extend((position, position, value) for position, value in insertions.items())
 
     patched = source
-    for start, end in sorted(edits, reverse=True):
-        patched = patched[:start] + patched[end:]
+    for start, end, replacement in sorted(edits, key=lambda edit: (edit[0], edit[1]), reverse=True):
+        patched = patched[:start] + replacement + patched[end:]
     if edits:
         ast.parse(patched, filename=str(path))
-    return patched, len(edits)
+    return patched, annotation_count, bool_chain_count
 
 
 def main() -> None:
     import triton
 
     if not triton.__version__.startswith("3.2."):
-        print(f"FlexGEMM pointer patch skipped for Triton {triton.__version__}", flush=True)
+        print(f"FlexGEMM compatibility patch skipped for Triton {triton.__version__}", flush=True)
         return
 
     spec = importlib.util.find_spec("flex_gemm")
@@ -64,11 +91,11 @@ def main() -> None:
     if not kernel_root.is_dir():
         raise RuntimeError(f"FlexGEMM Triton kernels not found: {kernel_root}")
 
-    changed_files = total_annotations = 0
+    changed_files = total_annotations = total_bool_chains = 0
     for path in sorted(kernel_root.rglob("*.py")):
         original = path.read_bytes()
-        patched, count = remove_unsupported_annotations(original, path)
-        if not count:
+        patched, annotation_count, bool_chain_count = patch_source(original, path)
+        if not annotation_count and not bool_chain_count:
             continue
         backup = path.with_name(path.name + BACKUP_SUFFIX)
         if not backup.exists():
@@ -82,11 +109,13 @@ def main() -> None:
         finally:
             temporary_path.unlink(missing_ok=True)
         changed_files += 1
-        total_annotations += count
+        total_annotations += annotation_count
+        total_bool_chains += bool_chain_count
 
     print(
         f"FlexGEMM/Triton {triton.__version__}: removed {total_annotations} "
-        f"unsupported annotations in {changed_files} files; originals saved as *{BACKUP_SUFFIX}",
+        f"unsupported annotations and grouped {total_bool_chains} boolean chains "
+        f"in {changed_files} files; originals saved as *{BACKUP_SUFFIX}",
         flush=True,
     )
 
