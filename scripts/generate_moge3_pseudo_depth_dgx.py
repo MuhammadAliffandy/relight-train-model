@@ -146,6 +146,16 @@ def save_label(path: Path, depth: np.ndarray, valid: np.ndarray, intrinsics: np.
         temporary.unlink(missing_ok=True)
 
 
+def make_triton_dtype_compatible() -> None:
+    import triton
+    import triton.language as tl
+
+    if not hasattr(tl.int32, "itemsize"):
+        # FlexGEMM's pinned kernel expects this attribute; Triton 3.2 exposes bit width instead.
+        tl.dtype.itemsize = property(lambda self: self.primitive_bitwidth // 8)
+        print(f"Applied FlexGEMM dtype compatibility for Triton {triton.__version__}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--images", type=Path, default=Path("data/celebamask_hq/images"))
@@ -169,6 +179,7 @@ def main() -> None:
         parser.error(f"Missing groups manifest: {args.groups}")
     if not torch.cuda.is_available():
         raise RuntimeError("MoGe-3 pseudo-label generation requires a CUDA GPU")
+    make_triton_dtype_compatible()
     try:
         from moge.model.v3 import MoGeModel
     except ImportError as error:
