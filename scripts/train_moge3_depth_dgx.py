@@ -19,9 +19,10 @@ from relight_train.model import PortraitGeometryModel
 
 
 class MoGeDepthDataset(Dataset):
-    def __init__(self, rows: list[dict], size: int):
+    def __init__(self, rows: list[dict], height: int, width: int):
         self.rows = rows
-        self.size = size
+        self.height = height
+        self.width = width
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -31,10 +32,16 @@ class MoGeDepthDataset(Dataset):
         with Image.open(row["image"]) as source:
             image = source.convert("RGB")
             original_size = image.size
-            rgb = np.asarray(
-                image.resize((self.size, self.size), Image.Resampling.BILINEAR),
+            scale = min(self.width / original_size[0], self.height / original_size[1])
+            resized_width = min(self.width, max(1, round(original_size[0] * scale)))
+            resized_height = min(self.height, max(1, round(original_size[1] * scale)))
+            left = (self.width - resized_width) // 2
+            top = (self.height - resized_height) // 2
+            rgb = np.full((self.height, self.width, 3), 0.5, dtype=np.float32)
+            rgb[top:top + resized_height, left:left + resized_width] = np.asarray(
+                image.resize((resized_width, resized_height), Image.Resampling.BILINEAR),
                 dtype=np.float32,
-            ).copy() / 255.0
+            ) / 255.0
         with np.load(row["pseudo_label"], allow_pickle=False) as label:
             depth = label["depth_m"].astype(np.float32, copy=False)
             valid = label["valid_mask"].astype(bool, copy=False)
@@ -43,18 +50,22 @@ class MoGeDepthDataset(Dataset):
         valid = valid & np.isfinite(depth) & (depth > 0)
         weighted = np.asarray(
             Image.fromarray(np.where(valid, depth, 0).astype(np.float32)).resize(
-                (self.size, self.size), Image.Resampling.BILINEAR
+                (resized_width, resized_height), Image.Resampling.BILINEAR
             ),
             dtype=np.float32,
         )
         coverage = np.asarray(
             Image.fromarray(valid.astype(np.float32)).resize(
-                (self.size, self.size), Image.Resampling.BILINEAR
+                (resized_width, resized_height), Image.Resampling.BILINEAR
             ),
             dtype=np.float32,
         )
-        resized_valid = coverage > 0.99
-        resized_depth = np.divide(weighted, np.maximum(coverage, 1e-6))
+        fitted_valid = coverage > 0.99
+        fitted_depth = np.divide(weighted, np.maximum(coverage, 1e-6))
+        resized_valid = np.zeros((self.height, self.width), dtype=bool)
+        resized_depth = np.zeros((self.height, self.width), dtype=np.float32)
+        resized_valid[top:top + resized_height, left:left + resized_width] = fitted_valid
+        resized_depth[top:top + resized_height, left:left + resized_width] = fitted_depth
         resized_depth[~resized_valid] = 0
         if np.count_nonzero(resized_valid) < 64:
             raise ValueError(f"Too few valid depth pixels: {row['sample_id']}")
@@ -160,7 +171,8 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--init-checkpoint", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=384)
     parser.add_argument("--expected-images", type=int, default=30000)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=100)
@@ -173,7 +185,8 @@ def main():
     parser.add_argument("--gradient-weight", type=float, default=0.2)
     parser.add_argument("--metric-weight", type=float, default=0.1)
     args = parser.parse_args()
-    if (args.size < 32 or args.size % 32 or args.expected_images < 1 or
+    if (min(args.height, args.width) < 32 or args.height % 32 or args.width % 32 or
+            args.expected_images < 1 or
             min(args.batch_size, args.epochs, args.snapshot_interval, args.log_every) < 1 or
             args.workers < 0 or min(args.encoder_lr, args.head_lr) <= 0 or
             min(args.gradient_weight, args.metric_weight) < 0):
@@ -197,15 +210,16 @@ def main():
     options = {"batch_size": args.batch_size, "num_workers": args.workers, "pin_memory": True}
     if args.workers:
         options["persistent_workers"] = True
-    train_loader = DataLoader(MoGeDepthDataset(splits["train"], args.size), shuffle=True, **options)
-    val_loader = DataLoader(MoGeDepthDataset(splits["validation"], args.size), shuffle=False, **options)
+    train_loader = DataLoader(MoGeDepthDataset(splits["train"], args.height, args.width), shuffle=True, **options)
+    val_loader = DataLoader(MoGeDepthDataset(splits["validation"], args.height, args.width), shuffle=False, **options)
     args.run_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         "manifest_sha256": manifest_sha,
         "init_checkpoint": str(args.init_checkpoint.resolve()),
         "teacher_checkpoint_sha256": teacher["checkpoint_sha256"],
         "teacher_refine_steps": 0,
-        "size": args.size, "epochs": args.epochs, "batch_size": args.batch_size,
+        "input_size": [args.height, args.width], "preprocessing": "fit_pad_gray_0.5",
+        "epochs": args.epochs, "batch_size": args.batch_size,
         "seed": args.seed, "encoder_lr": args.encoder_lr, "head_lr": args.head_lr,
         "gradient_weight": args.gradient_weight, "metric_weight": args.metric_weight,
         "train_count": len(splits["train"]), "validation_count": len(splits["validation"]),
@@ -219,7 +233,8 @@ def main():
         metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     experiment = dict(
         source_exp, name=args.run_dir.name, init_checkpoint=str(args.init_checkpoint.resolve()),
-        input_size=[args.size, args.size], depth_training_target="MoGe-3 base metric pseudo-depth",
+        input_size=[args.height, args.width], preprocessing="fit_pad_gray_0.5",
+        depth_training_target="MoGe-3 base metric pseudo-depth",
         normal_training=False, normal_head_frozen=True,
         teacher_refine_steps=0, teacher_manifest_sha256=manifest_sha,
     )
