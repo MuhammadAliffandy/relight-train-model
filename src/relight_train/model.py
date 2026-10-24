@@ -339,3 +339,44 @@ class PortraitGeometryModel(nn.Module):
         if return_coarse:
             return depth, normals, coarse_depth, coarse_normal
         return depth, normals
+
+
+class PortraitDepthStudent(nn.Module):
+    """FastViT depth student with a fresh decoder and no normal branch."""
+
+    def __init__(self, pretrained=True, fpn_width=72, fpn_fusion="concat_all", detail_width=24):
+        super().__init__()
+        self.encoder = FastViTEncoder(pretrained)
+        self.neck = CompactFPN(self.encoder.channels, width=fpn_width, fusion=fpn_fusion)
+        self.depth_head = MobileTaskHead(fpn_width, 1)
+        self.detail_stem = nn.Sequential(
+            nn.Conv2d(1, detail_width, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(detail_width),
+            nn.ReLU(inplace=True),
+        )
+        self.detail_fuse = nn.Sequential(
+            nn.Conv2d(fpn_width + detail_width + 1, detail_width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(detail_width),
+            nn.ReLU(inplace=True),
+            DepthwiseSeparableBlock(detail_width),
+            nn.Conv2d(detail_width, 1, 1),
+        )
+        nn.init.zeros_(self.detail_fuse[-1].weight)
+        nn.init.zeros_(self.detail_fuse[-1].bias)
+        self.register_buffer("rgb_mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1))
+        self.register_buffer("rgb_std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1))
+
+    def forward(self, rgb, return_feature=False):
+        fused = self.neck(self.encoder((rgb - self.rgb_mean) / self.rgb_std))
+        coarse_logits = self.depth_head.predict(self.depth_head.refine(fused))
+        luminance = 0.299 * rgb[:, :1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+        detail_rgb = self.detail_stem(luminance)
+        half_size = detail_rgb.shape[-2:]
+        coarse_half = F.interpolate(coarse_logits, size=half_size, mode="bilinear", align_corners=False)
+        detail_fpn = F.interpolate(fused, size=half_size, mode="bilinear", align_corners=False)
+        delta_half = self.detail_fuse(torch.cat((detail_fpn, detail_rgb, coarse_half), dim=1))
+        logits = F.interpolate(coarse_half + delta_half, size=rgb.shape[-2:], mode="bilinear", align_corners=False)
+        depth = F.softplus(logits)
+        if return_feature:
+            return depth, F.softplus(F.interpolate(coarse_logits, size=rgb.shape[-2:], mode="bilinear", align_corners=False)), fused
+        return depth
