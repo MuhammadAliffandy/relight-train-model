@@ -20,7 +20,7 @@ The cache is resumable in `data/celebamask_hq/moge3_base_features_v10`. Its feat
 ps -p "$(cat logs/v10_moge_feature_cache.pid)" -o pid,stat,etime,cmd
 ```
 
-The log must end with `READY: 30000/30000 cached features`. Do not start KD training from a partial cache. For a three-image extraction check, use `bash scripts/launch_v10_moge_feature_cache_dgx.sh --limit 3`, then run the launcher again without `--limit` to finish the cache.
+The log must end with `READY: 30000/30000 cached features` and `FEATURE_EXIT_STATUS=0`. Do not start KD training from a partial cache. For a three-image extraction check, use `bash scripts/launch_v10_moge_feature_cache_dgx.sh --limit 3`, then run the launcher again without `--limit` to finish the cache.
 
 ## 2. Train the student
 
@@ -30,7 +30,7 @@ V10_TRAIN_PYTHON="$(command -v python)" bash scripts/launch_v10_moge_distill_dgx
 tail -f logs/v10_moge_feature_kd_384x512.log
 ```
 
-The training process logs every 100 batches, saves `last_checkpoint.pt` after each epoch, retains the best validation checkpoint, and writes `history.jsonl`. Feature loss has weight 0.02 after a five-epoch warmup. `best_deploy.pt` contains only the student model and inference metadata; use that file for Relight Lab and later iOS conversion. Rerun the same launcher after an interruption to resume from the last completed epoch. The held-out test split is not used for checkpoint selection. The validation split is only sample-disjoint unless an identity manifest was supplied during labeling.
+The training process logs every 100 batches, saves `last_checkpoint.pt` after each epoch, retains the best validation checkpoint, and writes `history.jsonl`. It ends with `TRAIN_EXIT_STATUS=0` on success. Feature loss has weight 0.02 after a five-epoch warmup. `best_deploy.pt` contains only the student model and inference metadata; use that file for Relight Lab and later iOS conversion. Rerun the same launcher after an interruption to resume from the last completed epoch. The held-out test split is not used for checkpoint selection. The validation split is only sample-disjoint unless an identity manifest was supplied during labeling.
 
 For a controlled output-only comparison with exactly the same student architecture, set a separate run, log, and PID file and override the feature weight:
 

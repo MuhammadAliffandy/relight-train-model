@@ -25,7 +25,16 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 "$PYTHON" -c 'import torch, timm; assert torch.cuda.is_available(), "CUDA unavailable"'
-setsid nohup "$PYTHON" -u scripts/train_v10_moge_distill_dgx.py \
+setsid nohup bash -c '
+  "$@" &
+  child=$!
+  forward_signal() { kill "$child" 2>/dev/null || true; }
+  trap forward_signal TERM INT
+  wait "$child"
+  status=$?
+  printf "TRAIN_EXIT_STATUS=%s\n" "$status"
+  exit "$status"
+' v10_train "$PYTHON" -u scripts/train_v10_moge_distill_dgx.py \
   --manifest "$MANIFEST" --feature-root "$FEATURE_ROOT" --run-dir "$RUN" \
   --height 512 --width 384 --batch-size 4 --epochs 100 \
   --feature-weight 0.02 --workers 4 --log-every 100 --snapshot-interval 10 "$@" \

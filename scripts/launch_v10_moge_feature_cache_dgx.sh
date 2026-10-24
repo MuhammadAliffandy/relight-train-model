@@ -25,7 +25,16 @@ fi
 
 "$PYTHON" scripts/patch_flexgemm_triton32_dgx.py
 "$PYTHON" -c 'import torch; from moge.model.v3 import MoGeModel; assert torch.cuda.is_available(), "CUDA unavailable"'
-setsid nohup "$PYTHON" -u scripts/cache_moge3_teacher_features_dgx.py \
+setsid nohup bash -c '
+  "$@" &
+  child=$!
+  forward_signal() { kill "$child" 2>/dev/null || true; }
+  trap forward_signal TERM INT
+  wait "$child"
+  status=$?
+  printf "FEATURE_EXIT_STATUS=%s\n" "$status"
+  exit "$status"
+' v10_feature "$PYTHON" -u scripts/cache_moge3_teacher_features_dgx.py \
   --manifest "$MANIFEST" --checkpoint "$CHECKPOINT" --output "$OUTPUT" "$@" \
   > "$LOG" 2>&1 < /dev/null &
 echo $! > "$PID_FILE"
